@@ -1,4 +1,24 @@
+# Exclure les environnements Python
 __pycache__/
 *.pyc
+*.pyo
 env/
-.vscode/
+venv/
+
+# Exclure les modules Node.js
+node_modules/
+npm-debug.log*
+
+# Fichiers générés par Hardhat
+cache/
+artifacts/
+
+# Clés API et secrets
+.env
+
+# Exclure les fichiers de logs
+*.log
+
+# Fichiers système
+.DS_Store
+Thumbs.db
