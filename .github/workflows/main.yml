@@ -24,7 +24,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: Python 3.10.16
+          python-version: 3.10.15
 
       # Étape 3 : Installation des dépendances
       - name: Install dependencies
