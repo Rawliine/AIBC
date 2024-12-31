@@ -22,3 +22,6 @@ artifacts/
 # Fichiers système
 .DS_Store
 Thumbs.db
+
+# Fichiers de sauvegarde
+ray_results/

@@ -1,106 +1,181 @@
+# train/trainer.py
+
 import os
 import torch
+import time
 import ray
+
 from ray.train.torch import TorchTrainer
-from ray.air.config import ScalingConfig
+from ray.air.config import ScalingConfig, RunConfig
+from ray.train import Checkpoint
 
-from train.data_loader import load_dataset_distributed
+from train.data_loader import load_dataset_and_partition
 from train.model import SimpleTransformer
-from train.utils import log_memory_usage_gpu, log_memory_usage_cpu, logger
+from train.utils import (
+    logger,
+    log_memory_usage_cpu,
+    log_memory_usage_gpu,
+    save_checkpoint,
+    load_checkpoint,
+    collate_batch
+)
 
-def train_loop_per_worker(config):
+def worker_train_loop(config):
     """
-    Fonction de training exécutée par chaque worker Ray.
-    - Récupère sa partition de données
-    - Fait un forward/backward sur la partition
-    - Simule une agrégation de gradients
+    Fonction exécutée par chaque worker Ray.
+    - Récupère la partition
+    - Boucle sur epochs, mini-batches
+    - Fait forward/backward
+    - Sauvegarde un checkpoint
     """
-    rank = ray.train.get_context().get_world_rank()
+    import torch.distributed as dist
+    from ray.train import get_context
+
+    train_context = get_context()
+    rank = train_context.get_world_rank()
+    world_size = train_context.get_world_size()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # On reconstruit un mini-modèle identique sur chaque worker
+    partitions = config["partitions"]   # liste de partitions (Dataset HF) => partitions[rank]
+    seq_len = config["seq_len"]
+    batch_size = config["batch_size"]
+    epochs = config["epochs"]
+    lr = config["lr"]
+    embed_dim = config["embed_dim"]
+    num_heads = config["num_heads"]
+    checkpoint_path = config["checkpoint_path"]
+
+    # Construire le modèle
+    # On fixe vocab_size à la taille du tokenizer vocab (~30k / 30522 pour BERT)
+    # ou bien un petit param. 
     model = SimpleTransformer(
-        vocab_size=config["vocab_size"], 
-        embed_dim=config["embed_dim"], 
-        seq_len=config["seq_len"]
+        vocab_size=30522,  # ou len(tokenizer) si on veut
+        embed_dim=embed_dim,
+        seq_len=seq_len,
+        num_heads=num_heads,
+        num_classes=4
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # Chargement local de la partition (simulé ci-dessous en dur).
-    # Dans un flux plus complexe, on pourrait charger la partition
-    # associée au worker (ex: partitions[rank]).
-    data_partition = config["partitions"][rank]
+    # Charger un éventuel checkpoint
+    start_epoch, prev_loss = load_checkpoint(checkpoint_path, model, optimizer)
 
-    # On simule un batch unique (32 tokens x batch_size=8, par ex.)
-    # Dans la vraie vie, on itèrerait sur data_partition en mini-batches
-    batch_size = 8
-    dummy_tokens = torch.randint(0, config["vocab_size"], (batch_size, config["seq_len"]), device=device)
-    # Labels fictifs
-    dummy_labels = torch.randn(batch_size, device=device)
+    # Récupérer la partition associée à ce worker
+    my_dataset = partitions[rank]
+    # Convertir en liste pour itérer
+    my_data_list = list(my_dataset)
 
-    log_memory_usage_cpu(f"Worker {rank} - Avant forward/backward")
-    log_memory_usage_gpu(f"Worker {rank} - Avant forward/backward")
+    # On peut shuffle localement
+    rng = torch.Generator().manual_seed(42 + rank)
 
-    model.train()
-    # Forward
-    outputs = model(dummy_tokens)
-    loss = torch.nn.functional.mse_loss(outputs, dummy_labels)
-    # Backward
-    optimizer.zero_grad()
-    loss.backward()
+    for epoch in range(start_epoch, epochs):
+        t0 = time.time()
+        model.train()
+        # shuffle local
+        indices = torch.randperm(len(my_data_list), generator=rng).tolist()
+        my_data_list_shuffled = [my_data_list[i] for i in indices]
 
-    # -- ICI : on simule la réduction/all-reduce des gradients entre workers --
-    #   Sur un vrai cluster, on utiliserait torch.distributed.all_reduce
-    #   ou Ray Collectives pour agréger les gradients. Ex. :
-    #   for param in model.parameters():
-    #       if param.grad is not None:
-    #           dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-    #           param.grad.data /= world_size
-    # Comme on est en local sur 1 machine, on omet ce passage (ou on l’imite).
+        epoch_loss = 0.0
+        step_count = 0
+        # mini-batch loop
+        for start_idx in range(0, len(my_data_list_shuffled), batch_size):
+            batch_slice = my_data_list_shuffled[start_idx : start_idx + batch_size]
+            texts_t, labels_t = collate_batch(batch_slice, seq_len=seq_len)
+            texts_t = texts_t.to(device)
+            labels_t = labels_t.to(device)
 
-    # Update
-    optimizer.step()
+            optimizer.zero_grad()
+            logits = model(texts_t)
+            loss = torch.nn.functional.cross_entropy(logits, labels_t)
+            loss.backward()
 
-    log_memory_usage_cpu(f"Worker {rank} - Apres backward/step")
-    log_memory_usage_gpu(f"Worker {rank} - Apres backward/step")
+            # (Optionnel) Agrégation de gradients => dist.all_reduce
+            # for p in model.parameters():
+            #     if p.grad is not None:
+            #         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            #         p.grad /= world_size
 
-    logger.info(f"Worker {rank}: loss = {loss.item():.4f}")
+            optimizer.step()
 
-def run_training(num_workers: int = 2):
+            epoch_loss += loss.item()
+            step_count += 1
+
+            if step_count % 100 == 0:
+                logger.info(f"[Worker {rank}] Epoch {epoch} Step {step_count} - loss={loss.item():.4f}")
+                log_memory_usage_cpu(f"Worker {rank}")
+                log_memory_usage_gpu(f"Worker {rank}")
+
+        epoch_loss /= max(step_count, 1)
+        dt = time.time() - t0
+        logger.info(f"[Worker {rank}] Finished epoch {epoch} with loss={epoch_loss:.4f} in {dt:.1f}s")
+
+        # Sauvegarder checkpoint
+        save_checkpoint(epoch + 1, model, optimizer, epoch_loss, checkpoint_path)
+
+    logger.info(f"[Worker {rank}] Training complete.")
+
+def run_training(
+    num_workers: int = 4,
+    epochs: int = 3,
+    batch_size: int = 64,
+    seq_len: int = 32,
+    embed_dim: int = 128,
+    num_heads: int = 2,
+    checkpoint_path: str = "checkpoint.pt"
+):
     """
-    Fonction principale orchestrant le data parallelisme sur un GPU unique,
-    mais réparti en N workers Ray (simulé).
+    Fonction orchestrant l'entraînement distribué (local) avec Ray.
+    - on charge/partitionne le dataset
+    - on configure TorchTrainer (4 workers, etc.)
     """
-    # Initialiser Ray globalement
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
 
-    # Charger le dataset "partitionné"
-    partitions = load_dataset_distributed(num_workers)
+    # Charger dataset & partitions
+    data_loaded = load_dataset_and_partition(num_workers, batch_size)
+
+
+    partitions = data_loaded["train_partitions"]
+    # val_dataset = data_loaded["val_dataset"]  # si on veut une val
+
+    # Config envoyée à chaque worker
+    train_loop_config = {
+        "partitions": partitions,
+        "seq_len": seq_len,
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "lr": 1e-3,
+        "embed_dim": embed_dim,
+        "num_heads": num_heads,
+        "checkpoint_path": checkpoint_path,
+    }
 
     trainer = TorchTrainer(
-        train_loop_per_worker=train_loop_per_worker,
-        # On passe la config qui sera transmise à chaque worker
-        train_loop_config={
-            "vocab_size": 1000,
-            "embed_dim": 128,
-            "seq_len": 32,
-            "lr": 1e-3,
-            "partitions": partitions,
-        },
+        train_loop_per_worker=worker_train_loop,
+        train_loop_config=train_loop_config,
         scaling_config=ScalingConfig(
             num_workers=num_workers,
-            resources_per_worker={"CPU": 0.25, "GPU": 0.25},
-            use_gpu=torch.cuda.is_available(),  # un GPU si dispo
+            use_gpu=torch.cuda.is_available(),
+            resources_per_worker={"CPU": 0.25, "GPU": 0.25},  # ajuster si saturation
+        ),
+        run_config=RunConfig(
+            name="AGNews_Transformer_Prototype",
+            # On donne un chemin absolu si on veut
+            storage_path=f"file://{os.path.abspath('ray_results')}"
         ),
     )
 
     result = trainer.fit()
-    logger.info(f"Training terminé. Résultat: {result}")
-    ray.shutdown()
-
+    logger.info(f"Training done. Ray result: {result}")
 
 if __name__ == "__main__":
-    # Exemple: lancer 2 "workers" qui partagent (virtuellement) un seul GPU
-    run_training(num_workers=4)
+    run_training(
+        num_workers=4,
+        epochs=3,
+        batch_size=64,
+        seq_len=32,
+        embed_dim=128,
+        num_heads=2
+    )
