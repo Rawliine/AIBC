@@ -1,5 +1,3 @@
-# train/trainer.py
-
 import os
 import torch
 import time
@@ -9,8 +7,8 @@ from ray.train.torch import TorchTrainer
 from ray.air.config import ScalingConfig, RunConfig
 from ray.train import Checkpoint
 
-from train.data_loader import load_dataset_and_partition
-from train.model import SimpleTransformer
+# On importe DeeperTransformer (plus gros modèle) plutôt que SimpleTransformer
+from train.model import DeeperTransformer
 from train.utils import (
     logger,
     log_memory_usage_cpu,
@@ -19,6 +17,7 @@ from train.utils import (
     load_checkpoint,
     collate_batch
 )
+from train.data_loader import load_dataset_and_partition
 
 def worker_train_loop(config):
     """
@@ -37,23 +36,23 @@ def worker_train_loop(config):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    partitions = config["partitions"]   # liste de partitions (Dataset HF) => partitions[rank]
+    partitions = config["partitions"]   # liste de partitions => partitions[rank]
     seq_len = config["seq_len"]
     batch_size = config["batch_size"]
     epochs = config["epochs"]
     lr = config["lr"]
     embed_dim = config["embed_dim"]
     num_heads = config["num_heads"]
+    num_layers = config["num_layers"]
     checkpoint_path = config["checkpoint_path"]
 
-    # Construire le modèle
-    # On fixe vocab_size à la taille du tokenizer vocab (~30k / 30522 pour BERT)
-    # ou bien un petit param. 
-    model = SimpleTransformer(
-        vocab_size=30522,  # ou len(tokenizer) si on veut
+    # Construire le modèle plus profond
+    model = DeeperTransformer(
+        vocab_size=30522,  # taille approx. du vocab BERT
         embed_dim=embed_dim,
         seq_len=seq_len,
         num_heads=num_heads,
+        num_layers=num_layers,
         num_classes=4
     ).to(device)
 
@@ -64,8 +63,7 @@ def worker_train_loop(config):
 
     # Récupérer la partition associée à ce worker
     my_dataset = partitions[rank]
-    # Convertir en liste pour itérer
-    my_data_list = list(my_dataset)
+    my_data_list = list(my_dataset)  # Convertir en liste pour itérer
 
     # On peut shuffle localement
     rng = torch.Generator().manual_seed(42 + rank)
@@ -79,7 +77,7 @@ def worker_train_loop(config):
 
         epoch_loss = 0.0
         step_count = 0
-        # mini-batch loop
+
         for start_idx in range(0, len(my_data_list_shuffled), batch_size):
             batch_slice = my_data_list_shuffled[start_idx : start_idx + batch_size]
             texts_t, labels_t = collate_batch(batch_slice, seq_len=seq_len)
@@ -91,7 +89,7 @@ def worker_train_loop(config):
             loss = torch.nn.functional.cross_entropy(logits, labels_t)
             loss.backward()
 
-            # (Optionnel) Agrégation de gradients => dist.all_reduce
+            # (Optionnel) Agrégation de gradients si multi-GPU : 
             # for p in model.parameters():
             #     if p.grad is not None:
             #         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
@@ -117,25 +115,25 @@ def worker_train_loop(config):
     logger.info(f"[Worker {rank}] Training complete.")
 
 def run_training(
-    num_workers: int = 4,
-    epochs: int = 3,
-    batch_size: int = 64,
-    seq_len: int = 32,
-    embed_dim: int = 128,
-    num_heads: int = 2,
-    checkpoint_path: str = "checkpoint.pt"
+    num_workers: int = 1,        # Sur un seul GPU, souvent plus simple de mettre 1 worker
+    epochs: int = 5,
+    batch_size: int = 256,      # Augmenté
+    seq_len: int = 128,         # Augmenté
+    embed_dim: int = 256,       # Augmenté
+    num_heads: int = 8,         # Plus de têtes
+    num_layers: int = 6,        # 6 blocs
+    checkpoint_path: str = "checkpoint_deeper.pt"
 ):
     """
     Fonction orchestrant l'entraînement distribué (local) avec Ray.
     - on charge/partitionne le dataset
-    - on configure TorchTrainer (4 workers, etc.)
+    - on configure TorchTrainer
     """
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
 
     # Charger dataset & partitions
     data_loaded = load_dataset_and_partition(num_workers, batch_size)
-
 
     partitions = data_loaded["train_partitions"]
     # val_dataset = data_loaded["val_dataset"]  # si on veut une val
@@ -149,6 +147,7 @@ def run_training(
         "lr": 1e-3,
         "embed_dim": embed_dim,
         "num_heads": num_heads,
+        "num_layers": num_layers,
         "checkpoint_path": checkpoint_path,
     }
 
@@ -158,11 +157,11 @@ def run_training(
         scaling_config=ScalingConfig(
             num_workers=num_workers,
             use_gpu=torch.cuda.is_available(),
-            resources_per_worker={"CPU": 0.25, "GPU": 0.25},  # ajuster si saturation
+            # Sur 1 GPU, on donne 1 GPU au worker
+            resources_per_worker={"CPU": 0.25, "GPU": 0.25},
         ),
         run_config=RunConfig(
-            name="AGNews_Transformer_Prototype",
-            # On donne un chemin absolu si on veut
+            name="AGNews_DeeperTransformer",
             storage_path=f"file://{os.path.abspath('ray_results')}"
         ),
     )
@@ -172,10 +171,12 @@ def run_training(
 
 if __name__ == "__main__":
     run_training(
-        num_workers=4,
-        epochs=3,
-        batch_size=64,
-        seq_len=32,
-        embed_dim=128,
-        num_heads=2
+        num_workers=3,
+        epochs=5,
+        batch_size=256,
+        seq_len=128,
+        embed_dim=256,
+        num_heads=8,
+        num_layers=6,
+        checkpoint_path="checkpoint_deeper.pt"
     )
