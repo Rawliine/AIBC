@@ -120,6 +120,119 @@ cd your-repo
 ---
 
 ## Multi-Machine Distributed Training
+## Setting up Ray Cluster on WSL with Multiple Machines
+
+## 1. Port Forwarding Setup
+
+### On Head Node (192.168.1.29)
+In PowerShell (as administrator):
+```powershell
+# GCS server
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.29 listenport=6379 connectaddress=172.17.33.96 connectport=6379
+
+# Object Manager
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.29 listenport=8076 connectaddress=172.17.33.96 connectport=8076
+
+# Node Manager
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.29 listenport=8077 connectaddress=172.17.33.96 connectport=8077
+
+# Runtime Env Agent
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.29 listenport=8078 connectaddress=172.17.33.96 connectport=8078
+
+# Dashboard
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.29 listenport=8265 connectaddress=172.17.33.96 connectport=8265
+
+# Ray Client Server
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.29 listenport=10001 connectaddress=172.17.33.96 connectport=10001
+
+# Worker ports (using a smaller range for testing)
+for ($port = 10000; $port -le 10004; $port++) {
+    netsh interface portproxy add v4tov4 listenaddress=192.168.1.29 listenport=$port connectaddress=172.17.33.96 connectport=$port
+}
+```
+
+### On Worker Node (192.168.1.17)
+In PowerShell (as administrator):
+```powershell
+# GCS server
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.17 listenport=6379 connectaddress=172.28.94.168 connectport=6379
+
+# Object Manager
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.17 listenport=8076 connectaddress=172.28.94.168 connectport=8076
+
+# Node Manager
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.17 listenport=8077 connectaddress=172.28.94.168 connectport=8077
+
+# Runtime Env Agent
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.17 listenport=8078 connectaddress=172.28.94.168 connectport=8078
+
+# Dashboard
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.17 listenport=8265 connectaddress=172.28.94.168 connectport=8265
+
+# Ray Client Server
+netsh interface portproxy add v4tov4 listenaddress=192.168.1.17 listenport=10001 connectaddress=172.28.94.168 connectport=10001
+
+# Worker ports (using a smaller range for testing)
+for ($port = 10000; $port -le 10004; $port++) {
+    netsh interface portproxy add v4tov4 listenaddress=192.168.1.17 listenport=$port connectaddress=172.28.94.168 connectport=$port
+}
+```
+
+## 2. Firewall Rules
+
+### On Both Machines
+In PowerShell (as administrator):
+```powershell
+# Check existing rules
+Get-NetFirewallRule | Where-Object { $_.DisplayName -like "*Ray*" }
+
+# Remove existing rules if needed
+Remove-NetFirewallRule -DisplayName "Ray Cluster*"
+
+# Create new rules
+New-NetFirewallRule -DisplayName "Ray Cluster Inbound" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 6379,8076,8077,8265
+New-NetFirewallRule -DisplayName "Ray Cluster Outbound" -Direction Outbound -Action Allow -Protocol TCP -RemotePort 6379,8076,8077,8265
+```
+
+## 3. Environment Variables
+
+### On Both Machines
+In WSL:
+```bash
+# Set environment variables for network stability
+export RAY_health_check_timeout_ms=99999999999
+export RAY_grpc_keepalive_time_ms=99999999999
+export RAY_grpc_client_keepalive_time_ms=99999999999
+export RAY_grpc_client_keepalive_timeout_ms=99999999999
+export RAY_health_check_initial_delay_ms=99999999999
+export RAY_health_check_period_ms=99999999999
+export RAY_health_check_timeout_ms=99999999999
+export RAY_health_check_failure_threshold=10
+```
+
+## 4. Starting Ray
+
+### On Head Node
+In WSL:
+```bash
+# Stop any existing Ray processes
+ray stop
+sudo service redis-server stop
+
+# Start Ray head node
+ray start --head --port=6379 --object-manager-port=8076 --node-manager-port=8077 --dashboard-host=0.0.0.0 --dashboard-port=8265 --node-ip-address=0.0.0.0 --redis-password="123456"
+```
+
+### On Worker Node
+In WSL:
+```bash
+# Stop any existing Ray processes
+ray stop
+sudo service redis-server stop
+
+# Start Ray worker
+ray start --address=192.168.1.29:6379 --object-manager-port=8076 --node-manager-port=8077 --node-ip-address=0.0.0.0 --redis-password="123456"
+```
 
 ### Overview
 We use **Ray** to orchestrate multi-machine training. **Ray** can automatically distribute data or gradients across multiple workers. For complex transformer training, you can spawn multiple **Ray workers** that each process a partition of your dataset.
