@@ -279,4 +279,88 @@ We use **Ray** to orchestrate multi-machine training. **Ray** can automatically 
 
 ---
 
+## Monitoring and Metrics
+
+The project includes a comprehensive monitoring setup using Prometheus and Grafana for real-time metrics visualization.
+
+### Components
+
+1. **Ray Dashboard**
+   - Access at: `http://localhost:8265`
+   - Provides real-time cluster status, logs, and job information
+   - Metrics endpoint: `http://localhost:8081/metrics`
+
+2. **Prometheus**
+   - Access at: `http://localhost:9090`
+   - Scrapes metrics from Ray cluster
+   - Configuration: `/etc/prometheus/prometheus.yml`
+   - Default scrape interval: 15s
+
+3. **Grafana**
+   - Access at: `http://localhost:3000`
+   - Default credentials: admin/admin
+   - Visualizes metrics collected by Prometheus
+   - Custom dashboard for Ray metrics visualization
+
+### Setup Instructions
+
+1. **Start IPFS Daemon**
+   ```bash
+   ipfs daemon
+   ```
+
+2. **Start Prometheus**
+   ```bash
+   sudo -u prometheus /usr/local/bin/prometheus --config.file /etc/prometheus/prometheus.yml --storage.tsdb.path /var/lib/prometheus/
+   # Press Ctrl+Z, then bg to run in background
+   ```
+
+3. **Start Training with Monitoring**
+   ```bash
+   python -m train.trainer
+   ```
+
+4. **Access Dashboards**
+   - Ray Dashboard: `http://localhost:8265`
+   - Prometheus: `http://localhost:9090`
+   - Grafana: `http://localhost:3000`
+
+### Available Metrics
+
+The system exposes various Ray metrics including:
+- CPU utilization
+- Memory usage
+- Worker status
+- Task/actor counts
+- Object store metrics
+
+### Troubleshooting
+
+1. **Port Conflicts**
+   - Ray metrics: Port 8081
+   - IPFS Gateway: Port 8080
+   - Prometheus: Port 9090
+   - Grafana: Port 3000
+
+2. **Service Status**
+   - Check Prometheus targets: `http://localhost:9090/targets`
+   - Verify Ray metrics endpoint: `curl http://localhost:8081/metrics`
+   - Check Grafana data source: Configuration > Data Sources > Prometheus
+
+3. **Common Issues**
+   - If Prometheus shows "404 Not Found" for Ray metrics, verify the metrics port in `train/trainer.py`
+   - If Grafana shows no data, check Prometheus targets and time range settings
+   - If services don't start, check for port conflicts and running processes
+
+### Post-Restart Steps
+
+After system restart, the following services need to be manually started:
+1. IPFS Daemon
+2. Prometheus
+3. Training script
+
+Grafana starts automatically as a system service.
+
+---
+
 **For troubleshooting and contributions, see the issues tab!** 🚀

@@ -198,7 +198,7 @@ def run_training(
         ray.init(address="auto" if os.environ.get("RAY_ADDRESS") else None, 
                  ignore_reinit_error=True, 
                  include_dashboard=True,
-                 _metrics_export_port=8080  # Expose les métriques pour Prometheus
+                 _metrics_export_port=8081  # Expose les métriques pour Prometheus
                 )
 
     # Charger dataset & partitions
