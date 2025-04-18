@@ -10,7 +10,7 @@ class BlockchainInterface:
         
         # Charger l'ABI du contrat
         if contract_address:
-            with open('contracts/RewardDistribution.json', 'r') as f:
+            with open('blockchain/contracts/RewardDistribution.json', 'r') as f:
                 contract_json = json.load(f)
                 self.contract = self.w3.eth.contract(
                     address=contract_address,

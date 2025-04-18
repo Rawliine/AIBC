@@ -1,4 +1,4 @@
-# train/data_loader.py
+# dpodl_core/data_loader.py
 import os
 from typing import List, Any, Dict
 
