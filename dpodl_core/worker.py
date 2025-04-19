@@ -419,6 +419,7 @@ def worker_train_loop(config):
                     't1_threshold': t1_threshold,
                     't2_threshold': t2_threshold,
                     'final_model_state_hash': final_model_state_hash_hex, # Save hex
+                    'accuracy': accuracy,
                     'post_hash_value': post_hash_value,
                     'steps_at_checkpoint': current_total_steps,
                     'merkle_root': merkle_root_hex, # Save hex representation
@@ -490,6 +491,7 @@ def worker_train_loop(config):
                 't1_threshold': t1_threshold,
                 't2_threshold': t2_threshold,
                 'steps_at_checkpoint': total_steps_so_far + steps_this_run, # Best estimate
+                'accuracy': accuracy if 'accuracy' in locals() else None,
                 'merkle_root': merkle_root_hex,
                 'checkpoint_hashes': OrderedDict((str(k), bytes_to_hex(v)) for k, v in checkpoint_hashes.items()),
                 'trace_hash': emergency_trace_hash_hex, # Add trace hash if available
