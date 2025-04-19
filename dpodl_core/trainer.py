@@ -119,7 +119,7 @@ if __name__ == "__main__":
     run_training(
         num_workers=2,
         epochs=5,
-        batch_size=256,
+        batch_size=128,
         seq_len=128,
         embed_dim=256,
         num_heads=8,

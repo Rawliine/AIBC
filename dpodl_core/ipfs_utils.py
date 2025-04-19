@@ -11,7 +11,7 @@ IPFS_API_ADDR = '/ip4/127.0.0.1/tcp/5001'
 def get_ipfs_client():
     """Connects to the local IPFS daemon."""
     try:
-        client = ipfshttpclient.connect(IPFS_API_ADDR)
+        client = ipfshttpclient.connect(IPFS_API_ADDR, timeout=60)
         # Quick check if daemon is alive
         client.version() 
         logger.info(f"Connected to IPFS daemon at {IPFS_API_ADDR}")
