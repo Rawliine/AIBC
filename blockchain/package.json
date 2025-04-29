@@ -1,0 +1,19 @@
+{
+  "name": "hardhat-project",
+  "type": "commonjs",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "*",
+    "@nomicfoundation/hardhat-ethers": "*",
+    "@nomicfoundation/hardhat-network-helpers": "*",
+    "@nomicfoundation/hardhat-toolbox": "*",
+    "@nomiclabs/hardhat-etherscan": "*",
+    "@openzeppelin/contracts": "*",
+    "@typechain/ethers-v6": "*",
+    "@typechain/hardhat": "*",
+    "chai": "^4.3.0",
+    "ethers": "*",
+    "hardhat": "*",
+    "hardhat-gas-reporter": "*",
+    "solidity-coverage": "*"
+  }
+}
