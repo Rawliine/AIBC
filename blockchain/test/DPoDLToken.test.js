@@ -1,5 +1,6 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
 
 // Use BigNumber for large numbers - REMOVED for ethers v6
 // const { BigNumber } = ethers;
@@ -32,10 +33,26 @@ describe("DPoDLToken", function () {
     
   });
 
+  // Define the fixture
+  async function deployTokenFixture() {
+    const [owner, otherAccount, anotherAccount] = await ethers.getSigners();
+    const initialSupply = 1000000n; // Example initial supply
+
+    const DPoDLToken = await ethers.getContractFactory("DPoDLToken");
+    const token = await DPoDLToken.deploy(initialSupply);
+    await token.waitForDeployment();
+
+    // Return values needed for tests
+    return { token, owner, otherAccount, anotherAccount, initialSupply };
+  }
+
   // Test suite for Deployment
   describe("Deployment", function () {
-    it("Should set the right owner", async function () {
-      expect(await token.owner()).to.equal(owner.address);
+    it("Should set the right owner (admin role)", async function () {
+      const { token, owner } = await loadFixture(deployTokenFixture);
+      // Check if the owner has the DEFAULT_ADMIN_ROLE
+      const DEFAULT_ADMIN_ROLE = await token.DEFAULT_ADMIN_ROLE();
+      expect(await token.hasRole(DEFAULT_ADMIN_ROLE, owner.address)).to.equal(true);
     });
 
     it("Should assign the total supply of tokens to the owner", async function () {
@@ -130,12 +147,16 @@ describe("DPoDLToken", function () {
       expect(finalTotalSupply).to.equal(BigInt(initialTotalSupply) + toWei(mintAmount)); 
     });
 
-    it("Should prevent non-owners from minting tokens", async function () {
-       const mintAmount = 1000n; // Use BigInt
-      // addr1 tries to mint tokens
-      await expect(
-        token.connect(addr1).mint(addr2.address, toWei(mintAmount))
-      ).to.be.revertedWithCustomError(token, "OwnableUnauthorizedAccount");
+    it("Should prevent non-admins (without MINTER_ROLE) from minting tokens", async function () {
+      const { token, otherAccount } = await loadFixture(deployTokenFixture);
+      const amount = toWei(50);
+      const MINTER_ROLE = await token.MINTER_ROLE();
+      // Expect revert due to missing MINTER_ROLE using the custom error
+      // const expectedError = `AccessControl: account ${otherAccount.address.toLowerCase()} is missing role ${MINTER_ROLE}`;
+      await expect(token.connect(otherAccount).mint(otherAccount.address, amount))
+        .to.be.revertedWithCustomError(token, "AccessControlUnauthorizedAccount")
+        .withArgs(otherAccount.address, MINTER_ROLE);
+        // .to.be.revertedWith(expectedError);
     });
   });
 
