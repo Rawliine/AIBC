@@ -6,7 +6,7 @@ import logging
 import torch.distributed as dist
 import json # Added for saving trace
 import tempfile # Added for saving trace
-from ray.train import get_context
+from ray.train import get_context, report # Import report
 from torch.utils.data import DataLoader
 from collections import OrderedDict # Added for checkpoint hashes
 
@@ -39,6 +39,8 @@ from .crypto import (
     build_merkle_tree, # Import for Merkleization
     bytes_to_hex # Import for logging root hash
 )
+# Import blockchain interface functions
+from .blockchain_interface import submit_block, submit_mtx
 # crypto and ipfs_utils might be needed later
 # from .crypto import ... 
 # from .ipfs_utils import ...
@@ -126,6 +128,7 @@ def worker_train_loop(config):
     t1_threshold = config.get("t1_threshold", 2**256-1) # Default to max value (no threshold)
     t2_threshold = config.get("t2_threshold", 2**256-1) # Default to max value
     checkpoint_path = config["checkpoint_path"]
+    t_acc_threshold = config.get("t_acc_threshold", 0.9999) # Extract Tacc, default high
 
     # ===>>> Pre-Hash Stage (Finding Nonce) <<<===
     worker_logger.info(f"Starting Pre-Hash stage... Target T1: {t1_threshold}")
@@ -181,6 +184,27 @@ def worker_train_loop(config):
         num_classes=num_classes
     ).to(device)
     worker_logger.info(f"Target model structure instantiated on device {device}.")
+
+    # ===>>> Load Private Key for Signing <<<===
+    # Get the worker's rank to load a rank-specific private key
+    # rank = get_context().get_world_rank() # Already obtained earlier
+    
+    worker_specific_env_var = f"WORKER_PRIVATE_KEY_{rank}"
+    worker_private_key = os.getenv(worker_specific_env_var)
+
+    if not worker_private_key:
+        error_msg = f"{worker_specific_env_var} environment variable not set for worker {rank}. Each worker requires a unique private key."
+        worker_logger.error(error_msg)
+        raise ValueError(error_msg)
+    else:
+        try:
+            from web3 import Web3 # Local import for quick check
+            signer_address = Web3().eth.account.from_key(worker_private_key).address
+            worker_logger.info(f"Worker {rank} will sign transactions with address: {signer_address} (from {worker_specific_env_var})")
+        except Exception as key_err:
+            error_msg = f"Provided {worker_specific_env_var} for worker {rank} is invalid: {key_err}"
+            worker_logger.error(error_msg)
+            raise ValueError(error_msg)
 
     # --- Attempt Reference Model Loading & Weight Transfer ---
     reference_loaded_successfully = False
@@ -375,9 +399,19 @@ def worker_train_loop(config):
             worker_logger.info(f"Verifying Post-Hash against T2 threshold: {t2_threshold}")
             is_post_hash_valid = verify_post_hash_threshold(post_hash_value, t2_threshold)
 
+            # --- Decide Action based on Post-Hash and Accuracy --- 
+            action = "DISCARD"
             if is_post_hash_valid:
-                worker_logger.info("Post-Hash is VALID. Saving checkpoint...")
+                if accuracy >= t_acc_threshold:
+                    action = "SAVE_BLOCK_CHECKPOINT"
+                else:
+                    action = "SAVE_MTX_CHECKPOINT"
+            else:
+                action = "DISCARD"
+
+            worker_logger.info(f"Post-Epoch Action Decision: {action} (PostHash Valid: {is_post_hash_valid}, Accuracy: {accuracy:.4f} >= Tacc: {t_acc_threshold:.4f})")
                 
+            if action in ["SAVE_BLOCK_CHECKPOINT", "SAVE_MTX_CHECKPOINT"]:
                 # Build Merkle Tree for this epoch's state (or potentially full history)
                 # For simplicity, build based on all hashes collected so far
                 leaf_hashes = list(checkpoint_hashes.values())
@@ -409,8 +443,9 @@ def worker_train_loop(config):
                     # For now, we proceed without it.
                 # --- End Trace Saving/Hashing --- 
 
-                # Collect D-PoDL state for checkpointing
+                # Collect D-PoDL state for checkpointing (add accuracy explicitly)
                 current_dpodl_state = {
+                    'prev_block_hash': prev_block_hash, # Explicitly add prev_block_hash
                     'nonce': nonce,
                     'pre_hash_value': pre_hash_value,
                     'reference_model_id': reference_model_id,
@@ -418,8 +453,9 @@ def worker_train_loop(config):
                     'seed_for_weights': seed_for_weights,
                     't1_threshold': t1_threshold,
                     't2_threshold': t2_threshold,
+                    'accuracy': accuracy, # Ensure accuracy is saved
+                    't_acc_threshold': t_acc_threshold, # Save threshold used for decision
                     'final_model_state_hash': final_model_state_hash_hex, # Save hex
-                    'accuracy': accuracy,
                     'post_hash_value': post_hash_value,
                     'steps_at_checkpoint': current_total_steps,
                     'merkle_root': merkle_root_hex, # Save hex representation
@@ -429,11 +465,59 @@ def worker_train_loop(config):
                     'trace_file_path': trace_file_path # Optional: path if needed later (might be temp)
                 }
                 
+                checkpoint_type = "block_candidate" if action == "SAVE_BLOCK_CHECKPOINT" else "model_transaction"
+                worker_logger.info(f"Saving checkpoint for {checkpoint_type}...")
+
+                # --- Save Checkpoint (potentially getting IPFS CID) ---
                 ipfs_cid = save_checkpoint(
                     epoch + 1, model, optimizer, epoch_loss, 
-                    checkpoint_path, dpodl_state=current_dpodl_state
+                    checkpoint_path, 
+                    dpodl_state=current_dpodl_state
                 )
-                worker_logger.info(f"Checkpoint saved. IPFS CID (if IPFS running): {ipfs_cid}")
+                worker_logger.info(f"Checkpoint saved. Type: {checkpoint_type}. IPFS CID (if IPFS running): {ipfs_cid}")
+                
+                # ===>>> Submit Result to Blockchain <<<===
+                submission_receipt = None
+                if ipfs_cid: # Only submit if we have an IPFS CID for the checkpoint
+                    if action == "SAVE_BLOCK_CHECKPOINT":
+                        worker_logger.info("Submitting block candidate to ModelRegistry...")
+                        # Ensure post_hash_value is int (it's calculated as hex, needs conversion)
+                        try:
+                            post_hash_int = int(post_hash_value, 16) 
+                        except ValueError:
+                             worker_logger.error(f"Invalid post_hash_value hex string: {post_hash_value}. Cannot submit.")
+                             post_hash_int = None # Indicate error
+                             
+                        if post_hash_int is not None:
+                            submission_receipt = submit_block(
+                                ipfs_cid=ipfs_cid,
+                                accuracy_bps=int(accuracy * 10000), # Convert accuracy to BPS
+                                steps=current_total_steps,
+                                post_hash=post_hash_int, # Pass integer post-hash
+                                reference_cid=reference_model_id or "", # Use empty string for genesis
+                                signer_private_key=worker_private_key
+                            )
+                    elif action == "SAVE_MTX_CHECKPOINT":
+                        worker_logger.info("Submitting model transaction to MTXMempool...")
+                        submission_receipt = submit_mtx(
+                            ipfs_cid=ipfs_cid,
+                            accuracy_bps=int(accuracy * 10000),
+                            steps=current_total_steps,
+                            reference_cid=reference_model_id or "",
+                            signer_private_key=worker_private_key
+                        )
+                    
+                    # Log submission result
+                    if submission_receipt:
+                        worker_logger.info(f"Blockchain submission SUCCESSFUL for {action}. Tx: {submission_receipt.transactionHash.hex()}")
+                    else:
+                        worker_logger.error(f"Blockchain submission FAILED for {action} (CID: {ipfs_cid}). Check logs.")
+                        # How should failure be handled? Continue? Stop worker?
+                        # For now, just log the error.
+
+                else:
+                    worker_logger.warning(f"Skipping blockchain submission for {action} because IPFS CID is missing.")
+                # ===>>> End Blockchain Submission <<<===
                 
                 # Clean up trace file if it was temporary and hashing was successful
                 if trace_file_path and trace_hash_hex and "tmp" in trace_file_path:
@@ -447,7 +531,7 @@ def worker_train_loop(config):
                 # If resuming, trace should ideally be loaded, but this simple version resets.
                 training_trace = [] 
 
-            else:
+            else: # action == "DISCARD"
                 worker_logger.warning(f"Post-Hash INVALID for epoch {epoch}. Checkpoint not saved. Continuing training...")
 
                 # Decide if trace should be cleared even if checkpoint not saved
@@ -483,6 +567,7 @@ def worker_train_loop(config):
             merkle_root_hex = bytes_to_hex(merkle_root)
 
             emergency_dpodl_state = {
+                'prev_block_hash': prev_block_hash, # Explicitly add prev_block_hash
                 'nonce': nonce,
                 'pre_hash_value': pre_hash_value,
                 'reference_model_id': reference_model_id,
@@ -491,7 +576,6 @@ def worker_train_loop(config):
                 't1_threshold': t1_threshold,
                 't2_threshold': t2_threshold,
                 'steps_at_checkpoint': total_steps_so_far + steps_this_run, # Best estimate
-                'accuracy': accuracy if 'accuracy' in locals() else None,
                 'merkle_root': merkle_root_hex,
                 'checkpoint_hashes': OrderedDict((str(k), bytes_to_hex(v)) for k, v in checkpoint_hashes.items()),
                 'trace_hash': emergency_trace_hash_hex, # Add trace hash if available

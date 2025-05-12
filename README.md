@@ -261,7 +261,7 @@ We use **Ray** to orchestrate multi-machine training. **Ray** can automatically 
 
 4. **Run the Training Script**:
    ```bash
-   python train/trainer.py
+   python -m dpodl_core.trainer
    ```
 
 5. **Verify cluster status**:
@@ -360,7 +360,8 @@ After system restart, the following services need to be manually started:
 3. Training script
 
 Grafana starts automatically as a system service.
-
+pytest: Uninstalled version 8.3.5, installed version 8.3.4.
+ray: Uninstalled version 2.41.0, installed version 2.40.0.
 ---
 
 **For troubleshooting and contributions, see the issues tab!** 🚀
