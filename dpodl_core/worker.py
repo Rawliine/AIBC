@@ -440,14 +440,14 @@ def worker_train_loop(config):
             
             # --- Decide Action based on Post-Hash, Accuracy, and Verification --- 
             if is_state_consistent:
-            if is_post_hash_valid:
-                if accuracy >= t_acc_threshold:
-                    action = "SAVE_BLOCK_CHECKPOINT"
-                else:
-                    action = "SAVE_MTX_CHECKPOINT"
-                else:
+                if is_post_hash_valid:
+                    if accuracy >= t_acc_threshold:
+                        action = "SAVE_BLOCK_CHECKPOINT"
+                    else:
+                        action = "SAVE_MTX_CHECKPOINT"
+                else: # Corresponds to `if is_post_hash_valid:`
                     action = "DISCARD"
-            else:
+            else: # Corresponds to `if is_state_consistent:`
                 action = "DISCARD"
 
             worker_logger.info(f"Post-Epoch Action Decision: {action} (PostHash Valid: {is_post_hash_valid}, Accuracy: {accuracy:.4f} >= Tacc: {t_acc_threshold:.4f}, State Consistent: {is_state_consistent})")

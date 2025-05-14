@@ -71,7 +71,9 @@ IPFS_HOST = os.getenv("IPFS_HOST", "/ip4/127.0.0.1/tcp/5001/http")
 class PinataConfig:
     PINATA_API_KEY = os.getenv("PINATA_API_KEY", "YOUR_PINATA_API_KEY")
     PINATA_SECRET_API_KEY = os.getenv("PINATA_SECRET_API_KEY", "YOUR_PINATA_SECRET_API_KEY")
-    PINATA_API_URL = os.getenv("PINATA_API_URL", "https://api.pinata.cloud/pinning/pinJSONToIPFS")
+    PINATA_JWT = os.getenv("PINATA_JWT", "YOUR_PINATA_JWT")
+    PINATA_API_URL = os.getenv("PINATA_API_URL", "https://api.pinata.cloud/pinning/pinByHash")
+    ENABLE_PINNING = os.getenv("ENABLE_PINATA_PINNING", "false").lower() == "true"
 
 # D-PoDL specific parameters (defaults, can be fetched from ModelRegistry)
 DEFAULT_T1_THRESHOLD = "0x0000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
