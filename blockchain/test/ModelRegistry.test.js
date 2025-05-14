@@ -13,7 +13,7 @@ describe("ModelRegistry", function () {
     // Define the fixture for deploying contracts and setting up roles/ownership
     async function deployContractsAndTokenFixture() {
         // Get signers
-        const [owner, proposer1, proposer2, ...addrs] = await ethers.getSigners();
+        const [owner, proposer1, proposer2, referenceProposer, ...addrs] = await ethers.getSigners();
 
         // Deploy the DPoDLToken contract first
         const initialTokenSupply = 1000000n;
@@ -26,12 +26,22 @@ describe("ModelRegistry", function () {
         const initialT1Threshold = 50000n; // Example threshold (BigInt)
         const initialAccuracyThresholdBPS = 8500n; // 85.00% (BigInt)
         const initialBlockRewardAmount = toWei(100); // 100 DPDL tokens (BigInt)
+        const initialMinSteps = 100n;
+        const initialMaxSteps = 10000n;
+        const initialMinAccImprov = 100n; // 1%
+        const initialMinStepImprov = 50n;
+        const initialRefRewardShare = 2000n; // 20%
 
         const ModelRegistry = await ethers.getContractFactory("ModelRegistry");
         const registry = await ModelRegistry.deploy(
             initialT1Threshold,
             initialAccuracyThresholdBPS,
             initialBlockRewardAmount,
+            initialMinSteps,
+            initialMaxSteps,
+            initialMinAccImprov,
+            initialMinStepImprov,
+            initialRefRewardShare,
             tokenAddress,
             owner.address // Explicitly set the owner
         );
@@ -42,12 +52,16 @@ describe("ModelRegistry", function () {
         await token.connect(owner).grantRole(MINTER_ROLE, await registry.getAddress());
 
         // Return all necessary objects
-        return { token, registry, owner, proposer1, proposer2, addrs, initialT1Threshold, initialAccuracyThresholdBPS, initialBlockRewardAmount };
+        return { token, registry, owner, proposer1, proposer2, referenceProposer, addrs,
+                 initialT1Threshold, initialAccuracyThresholdBPS, initialBlockRewardAmount,
+                 initialMinSteps, initialMaxSteps, initialMinAccImprov, initialMinStepImprov,
+                 initialRefRewardShare };
     }
 
     // Use beforeEach only to load the fixture for most tests
-    let token, registry, owner, proposer1, proposer2, addrs;
+    let token, registry, owner, proposer1, proposer2, referenceProposer, addrs;
     let initialT1Threshold, initialAccuracyThresholdBPS, initialBlockRewardAmount;
+    let initialMinSteps, initialMaxSteps, initialMinAccImprov, initialMinStepImprov, initialRefRewardShare;
 
     beforeEach(async function () {
         // Load the fixture defined above
@@ -57,12 +71,16 @@ describe("ModelRegistry", function () {
         owner = fixtures.owner;
         proposer1 = fixtures.proposer1;
         proposer2 = fixtures.proposer2;
+        referenceProposer = fixtures.referenceProposer;
         addrs = fixtures.addrs;
         initialT1Threshold = fixtures.initialT1Threshold;
         initialAccuracyThresholdBPS = fixtures.initialAccuracyThresholdBPS;
         initialBlockRewardAmount = fixtures.initialBlockRewardAmount;
-        // ({ token, registry, owner, proposer1, proposer2, addrs, 
-        //   initialT1Threshold, initialAccuracyThresholdBPS, initialBlockRewardAmount } = await loadFixture(deployContractsAndTokenFixture));
+        initialMinSteps = fixtures.initialMinSteps;
+        initialMaxSteps = fixtures.initialMaxSteps;
+        initialMinAccImprov = fixtures.initialMinAccImprov;
+        initialMinStepImprov = fixtures.initialMinStepImprov;
+        initialRefRewardShare = fixtures.initialRefRewardShare;
     });
 
     describe("Deployment", function () {
@@ -74,6 +92,11 @@ describe("ModelRegistry", function () {
             expect(await registry.t1Threshold()).to.equal(initialT1Threshold);
             expect(await registry.tAccuracyThresholdBPS()).to.equal(initialAccuracyThresholdBPS);
             expect(await registry.blockRewardAmount()).to.equal(initialBlockRewardAmount);
+            expect(await registry.minTrainingSteps()).to.equal(initialMinSteps);
+            expect(await registry.maxTrainingSteps()).to.equal(initialMaxSteps);
+            expect(await registry.minAccuracyImprovementBPS()).to.equal(initialMinAccImprov);
+            expect(await registry.minStepImprovement()).to.equal(initialMinStepImprov);
+            expect(await registry.referenceRewardShareBPS()).to.equal(initialRefRewardShare);
         });
 
         it("Should set the correct DPDL token address", async function () {
@@ -95,6 +118,11 @@ describe("ModelRegistry", function () {
                 .to.emit(registry, "ParameterUpdated").withArgs("t1Threshold", initialT1Threshold)
                 .and.to.emit(registry, "ParameterUpdated").withArgs("tAccuracyThresholdBPS", initialAccuracyThresholdBPS)
                 .and.to.emit(registry, "ParameterUpdated").withArgs("blockRewardAmount", initialBlockRewardAmount)
+                .and.to.emit(registry, "ParameterUpdated").withArgs("minTrainingSteps", initialMinSteps)
+                .and.to.emit(registry, "ParameterUpdated").withArgs("maxTrainingSteps", initialMaxSteps)
+                .and.to.emit(registry, "ParameterUpdated").withArgs("minAccuracyImprovementBPS", initialMinAccImprov)
+                .and.to.emit(registry, "ParameterUpdated").withArgs("minStepImprovement", initialMinStepImprov)
+                .and.to.emit(registry, "ParameterUpdated").withArgs("referenceRewardShareBPS", initialRefRewardShare)
                 .and.to.emit(registry, "ParameterUpdated").withArgs("dpdlToken", BigInt(await token.getAddress())); // Compare BigInt representation of address
         });
 
@@ -105,6 +133,7 @@ describe("ModelRegistry", function () {
                 initialT1Threshold,
                 initialAccuracyThresholdBPS,
                 initialBlockRewardAmount,
+                100n, 10000n, 100n, 50n, 2000n, // Add dummy args for new params
                 ethers.ZeroAddress, // Use ZeroAddress constant
                 owner.address
             )).to.be.revertedWithCustomError(ModelRegistry, "ZeroAddress");
@@ -117,6 +146,7 @@ describe("ModelRegistry", function () {
                 initialT1Threshold,
                 initialAccuracyThresholdBPS,
                 initialBlockRewardAmount,
+                100n, 10000n, 100n, 50n, 2000n, // Add dummy args for new params
                 await token.getAddress(),
                 ethers.ZeroAddress // Use ZeroAddress constant
             )).to.be.revertedWithCustomError(ModelRegistry, "OwnableInvalidOwner") // Standard Ownable error
@@ -129,10 +159,24 @@ describe("ModelRegistry", function () {
             await expect(ModelRegistry.deploy(
                 initialT1Threshold,
                 10001n, // Invalid BPS > 10000
-                initialBlockRewardAmount,
+                100n, 10000n, 100n, 50n, 2000n, // Add dummy args for new params
                 await token.getAddress(),
                 owner.address
             )).to.be.revertedWith("Accuracy BPS cannot exceed 10000");
+        });
+
+        it("Should fail deployment with invalid reference reward share BPS", async function () {
+            const { initialT1Threshold, initialAccuracyThresholdBPS, initialBlockRewardAmount, token, owner } = await loadFixture(deployContractsAndTokenFixture);
+            const ModelRegistry = await ethers.getContractFactory("ModelRegistry");
+            await expect(ModelRegistry.deploy(
+                initialT1Threshold,
+                initialAccuracyThresholdBPS,
+                initialBlockRewardAmount,
+                100n, 10000n, 100n, 50n,
+                10001n, // Invalid ref share > 10000
+                await token.getAddress(),
+                owner.address
+            )).to.be.revertedWith("Reference reward share BPS cannot exceed 10000");
         });
     });
 
@@ -207,6 +251,62 @@ describe("ModelRegistry", function () {
            const finalBalance = await token.balanceOf(proposer1.address);
 
            expect(finalBalance).to.equal(initialBalance + rewardAmount);
+       });
+
+       it("Should split reward between proposer and reference proposer", async function() {
+            const firstCID = "firstRewardSplitCID";
+            const secondCID = "secondRewardSplitCID";
+            const t1Hash1 = "0x" + "0".repeat(63) + "A";
+            const t1Hash2 = "0x" + "0".repeat(63) + "B";
+            const accuracyBPS = 9000n;
+            const steps = 500n;
+            const genesisRef = "";
+
+            // ReferenceProposer submits the first block
+            await registry.connect(referenceProposer).submitBlock(firstCID, accuracyBPS, steps, t1Hash1, genesisRef);
+            const refProposerInitialBalance = await token.balanceOf(referenceProposer.address);
+
+            // Proposer1 submits the second block, referencing the first
+            const proposer1InitialBalance = await token.balanceOf(proposer1.address);
+            await registry.connect(proposer1).submitBlock(secondCID, accuracyBPS, steps, t1Hash2, firstCID);
+
+            // Calculate expected rewards
+            const totalReward = await registry.blockRewardAmount();
+            const refShare = await registry.referenceRewardShareBPS();
+            const expectedRefReward = (totalReward * refShare) / 10000n;
+            const expectedProposerReward = totalReward - expectedRefReward;
+
+            // Check balances
+            const proposer1FinalBalance = await token.balanceOf(proposer1.address);
+            const refProposerFinalBalance = await token.balanceOf(referenceProposer.address);
+
+            expect(proposer1FinalBalance).to.equal(proposer1InitialBalance + expectedProposerReward);
+            // Reference proposer got reward for block 1 + reference reward for block 2
+            expect(refProposerFinalBalance).to.equal(refProposerInitialBalance + expectedRefReward);
+        });
+
+       it("Should give full reward to proposer if they are also the reference proposer", async function() {
+            const firstCID = "selfReferenceCID1";
+            const secondCID = "selfReferenceCID2";
+            const t1Hash1 = "0x" + "0".repeat(63) + "C";
+            const t1Hash2 = "0x" + "0".repeat(63) + "D";
+            const accuracyBPS = 9000n;
+            const steps = 500n;
+            const genesisRef = "";
+
+            // Proposer1 submits the first block
+            await registry.connect(proposer1).submitBlock(firstCID, accuracyBPS, steps, t1Hash1, genesisRef);
+            const proposer1BalanceAfterFirst = await token.balanceOf(proposer1.address);
+
+            // Proposer1 submits the second block, referencing their own first block
+            await registry.connect(proposer1).submitBlock(secondCID, accuracyBPS, steps, t1Hash2, firstCID);
+
+            // Calculate expected reward (should be full amount)
+            const totalReward = await registry.blockRewardAmount();
+
+            // Check balance
+            const proposer1FinalBalance = await token.balanceOf(proposer1.address);
+            expect(proposer1FinalBalance).to.equal(proposer1BalanceAfterFirst + totalReward);
        });
 
        it("Should fail if reference model CID doesn't match current head", async function() {

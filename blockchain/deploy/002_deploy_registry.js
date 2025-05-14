@@ -1,7 +1,9 @@
 // blockchain/deploy/002_deploy_registry.js
 const { network, ethers } = require("hardhat");
 const { verify } = require("../utils/verify");
-const { developmentChains, initialT1Threshold, initialAccuracyThresholdBPS, initialBlockRewardAmount } = require("../helper-hardhat-config");
+const { developmentChains, initialT1Threshold, initialAccuracyThresholdBPS, initialBlockRewardAmount, 
+       initialMinTrainingSteps, initialMaxTrainingSteps, initialMinAccuracyImprovementBPS, initialMinStepImprovement,
+       initialReferenceRewardShareBPS } = require("../helper-hardhat-config");
 
 module.exports = async ({ getNamedAccounts, deployments }) => {
     const { deploy, log, get } = deployments;
@@ -20,6 +22,11 @@ module.exports = async ({ getNamedAccounts, deployments }) => {
         initialT1Threshold,
         initialAccuracyThresholdBPS,
         initialBlockRewardAmount,
+        initialMinTrainingSteps,
+        initialMaxTrainingSteps,
+        initialMinAccuracyImprovementBPS,
+        initialMinStepImprovement,
+        initialReferenceRewardShareBPS,
         tokenAddress,
         registryOwner, // Set the designated owner
     ];
