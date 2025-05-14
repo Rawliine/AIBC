@@ -3,6 +3,7 @@ import time
 import ray
 import torch
 import logging
+import argparse
 
 # Ray AIR / train
 from ray.train.torch import TorchTrainer
@@ -15,6 +16,7 @@ from .worker import worker_train_loop  # Import the worker loop
 from .utils import logger # Import logger if configured globally
 # Import the blockchain interface function
 from .blockchain_interface import get_current_reference_cid
+from .config_utils import get_config # Import the new config utility
 
 # Configure logging if not already done globally
 # logging.basicConfig(level=logging.INFO) 
@@ -35,20 +37,21 @@ def select_best_mtx(mempool):
 # ------------------------------------------------------
 
 def run_training(
-    num_workers: int = 1,
-    epochs: int = 5,
-    batch_size: int = 128,
-    seq_len: int = 128,
-    embed_dim: int = 256,
-    num_heads: int = 8,
-    num_layers: int = 6,
-    checkpoint_path: str = "checkpoint_deeper.pt",
-    # Add D-PoDL parameters with defaults
-    prev_block_hash: str = "0x0000000000000000", # Placeholder
-    t1_threshold: int = 2**240, # Placeholder High Threshold (easy)
-    t2_threshold: int = 2**256, # Placeholder Max Threshold (easy)
-    t_acc_threshold: float = 0.95, # Add Target Accuracy Threshold
-    reference_model_id: str = None # Placeholder
+    # num_workers: int = 1, # Now fetched from config
+    # epochs: int = 5, # Now fetched from config
+    # batch_size: int = 128, # Now fetched from config
+    # seq_len: int = 128, # Now fetched from config
+    # embed_dim: int = 256, # Now fetched from config
+    # num_heads: int = 8, # Now fetched from config
+    # num_layers: int = 6, # Now fetched from config
+    # checkpoint_path: str = "checkpoint_deeper.pt", # Now fetched from config
+    # # Add D-PoDL parameters with defaults
+    # prev_block_hash: str = "0x0000000000000000", # Placeholder # Now fetched from config
+    # t1_threshold: int = 2**240, # Placeholder High Threshold (easy) # Now fetched from config
+    # t2_threshold: int = 2**256, # Placeholder Max Threshold (easy) # Now fetched from config
+    # t_acc_threshold: float = 0.95, # Add Target Accuracy Threshold # Now fetched from config
+    # reference_model_id: str = None # Placeholder # Now fetched from config
+    cli_num_workers: int = None # Allow CLI override for num_workers
 ):
     """
     Orchestrates the distributed D-PoDL training using Ray Train.
@@ -58,6 +61,10 @@ def run_training(
     - Creates and runs the Ray TorchTrainer.
     """
     logger.info("Starting D-PoDL training orchestration...")
+    
+    # --- Load Configuration ---
+    app_config = get_config()
+    num_workers = cli_num_workers if cli_num_workers is not None else app_config.get("num_workers", 2) # Default to 2 if not in config
     # --- Ray Initialization --- 
     if not ray.is_initialized():
         logger.info("Initializing Ray...")
@@ -74,18 +81,31 @@ def run_training(
     # --- Data Loading --- 
     logger.info("Loading and partitioning dataset...")
     # Load both train and validation partitions
-    data_loaded = load_dataset_and_partition(num_workers, batch_size) 
+    data_loaded = load_dataset_and_partition(
+        dataset_name=app_config["dataset_name"],
+        num_workers=num_workers, 
+        batch_size=app_config["batch_size"],
+        dataset_path_override=app_config.get("dataset_path"),
+        num_train_samples=app_config.get("num_train_samples"),
+        num_val_samples=app_config.get("num_val_samples")
+    ) 
     train_partitions = data_loaded["train_partitions"]
     val_partition = data_loaded["val_dataset"] # Assuming val_dataset is suitable for all workers
     logger.info(f"Dataset loaded. Train partitions: {len(train_partitions)}, Val dataset: {val_partition}")
 
     # --- Determine Reference Model ID for this run --- 
     # Use the one passed in, otherwise get from the blockchain registry
-    if reference_model_id:
-        current_reference_model_id = reference_model_id
-        logger.info(f"Using provided reference_model_id: {current_reference_model_id}")
+    # current_reference_model_id = app_config["reference_model_id"] # Use config value
+    # Simplification: Always try to fetch from blockchain unless explicitly set in config for testing
+    
+    if app_config.get("reference_model_id_override") is not None: # Allow test override
+        current_reference_model_id = app_config["reference_model_id_override"]
+        logger.info(f"Using overridden reference_model_id from config: {current_reference_model_id}")
+    elif app_config["reference_model_id"]:
+        current_reference_model_id = app_config["reference_model_id"]
+        logger.info(f"Using provided reference_model_id from config: {current_reference_model_id}")
     else:
-        logger.info("No reference_model_id provided. Querying blockchain registry...")
+        logger.info("No reference_model_id in config. Querying blockchain registry...")
         current_reference_model_id = get_current_reference_cid()
         if not current_reference_model_id:
             # Handle case where blockchain call fails or returns empty (genesis)
@@ -98,23 +118,25 @@ def run_training(
     # --- Worker Configuration --- 
     train_loop_config = {
         # Data/Model params
-        "train_partitions": train_partitions, # Renamed for clarity
-        "val_partition": val_partition,     # Pass validation data
-        "seq_len": seq_len,
-        "batch_size": batch_size,
-        "epochs": epochs,
-        "lr": 1e-3,
-        "embed_dim": embed_dim, # Note: This might be overridden by HtoA
-        "num_heads": num_heads, # Note: This might be overridden by HtoA
-        "num_layers": num_layers, # Note: This might be overridden by HtoA
-        "checkpoint_path": checkpoint_path,
+        "train_partitions": train_partitions, 
+        "val_partition": val_partition,     
+        "seq_len": app_config["seq_len"],
+        "batch_size": app_config["batch_size"],
+        "epochs": app_config["epochs"],
+        "lr": app_config["lr"],
+        # Model architecture params - will be used if HtoA is not active or as fallback
+        "embed_dim": app_config["embed_dim"], 
+        "num_heads": app_config["num_heads"], 
+        "num_layers": app_config["num_layers"], 
+        "checkpoint_path": app_config["checkpoint_path"],
         # D-PoDL params
-        "prev_block_hash": prev_block_hash,
-        "t1_threshold": t1_threshold,
-        "t2_threshold": t2_threshold,
-        "t_acc_threshold": t_acc_threshold, # Pass Tacc to worker
-        # Use the determined reference model ID for this run
-        "reference_model_id": current_reference_model_id, 
+        "prev_block_hash": app_config["prev_block_hash"],
+        "t1_threshold": app_config["t1_threshold"],
+        "t2_threshold": app_config["t2_threshold"],
+        "t_acc_threshold": app_config["t_acc_threshold"],
+        "reference_model_id": current_reference_model_id,
+        "ipfs_enabled": app_config["ipfs_enabled"], # Pass IPFS enabled flag
+        "model_override_params": app_config.get("model_override_params") # Pass model override
     }
     # logger.info(f"Worker config prepared: {train_loop_config}") # Logged later if needed
 
@@ -152,71 +174,64 @@ def run_training(
     block_candidates = []
     new_mtx_candidates = []
 
-    if result.metrics_dataframe is not None:
-        # Ray Train reports metrics per-epoch/per-step usually.
-        # We need to filter for our specific reported status dicts.
-        # Let's look for the last report per worker if multiple reports exist.
-        # Group by worker index and get the last entry (assuming step increases)
-        # Note: Accessing custom reported dicts might need specific Ray versions/APIs.
-        # This approach assumes the dict is flattened or accessible.
-        # A simpler approach might be to look at result.checkpoint
-        
-        # Alternative: iterate through checkpoints if results are tied to them
-        # checkpoints = result.best_checkpoints # or result.checkpoints
+    # --- Process Metrics Dataframe for General Progress AND Submissions ---
+    if result.metrics_dataframe is not None and not result.metrics_dataframe.empty:
+        logger.info("Processing results from metrics_dataframe...")
+        for index, report_data in result.metrics_dataframe.iterrows():
+            worker_id_df = report_data.get("pid", report_data.get("hostname", f"worker_{report_data.get('trial_id', 'unknown')}"))
 
-        # Let's assume reported metrics are directly accessible (may need adjustment)
-        try:
-            # Example: Accessing metrics reported via `report()`
-            # The exact structure depends on Ray version and how reports are aggregated.
-            # We might need to access raw logs or a specific results attribute.
-            # Let's try iterating through the history which often contains reported dicts.
-            if result.metrics_dataframe is not None and not result.metrics_dataframe.empty:
-                 # Find rows containing our custom status report
-                 report_df = result.metrics_dataframe[result.metrics_dataframe['status'].notna()].copy()
-                 # Get the last report for each worker
-                 last_reports = report_df.loc[report_df.groupby('training_iteration')['steps'].idxmax()]
-                 
-                 for index, report_data in last_reports.iterrows():
-                    status = report_data.get("status")
-                    cid = report_data.get("ipfs_cid")
-                    acc = report_data.get("accuracy")
-                    steps = report_data.get("steps")
-                    # Potentially retrieve summary from flattened columns if needed
-                    # summary = report_data.get("dpodl_state_summary") 
-
-                    logger.info(f"  Worker reported: Status={status}, CID={cid}, Acc={acc:.4f}, Steps={steps}")
-                    
-                    if status == "SAVE_BLOCK_CHECKPOINT":
-                        block_candidates.append({"ipfs_cid": cid, "accuracy": acc, "steps": steps})
-                    elif status == "SAVE_MTX_CHECKPOINT":
-                        # Add to a temporary list first
-                        new_mtx_candidates.append({"ipfs_cid": cid, "accuracy": acc, "steps": steps})
+            # Check if this is a submission report
+            if report_data.get("is_submission_report") == True:
+                submission = {
+                    "epoch": report_data.get("submission_epoch"),
+                    "action_taken": report_data.get("submission_action"),
+                    "model_cid": report_data.get("submission_model_cid"),
+                    "tx_hash": report_data.get("submission_tx_hash"),
+                    "accuracy": report_data.get("submission_accuracy"),
+                    "total_steps_overall": report_data.get("submission_total_steps"),
+                    "worker_rank": report_data.get("submission_worker_rank") # Changed from rank to worker_rank for consistency
+                }
+                logger.info(f"  Extracted SUBMISSION from metrics_dataframe (Worker {submission['worker_rank']}): {submission}")
+                if submission["action_taken"] == "SAVE_BLOCK_CHECKPOINT":
+                    block_candidates.append(submission)
+                elif submission["action_taken"] == "SAVE_MTX_CHECKPOINT":
+                    new_mtx_candidates.append(submission)
             else:
-                 logger.warning("No metrics dataframe found or it is empty.")
+                # This is a regular end-of-epoch report, log general progress
+                epoch_num_df = report_data.get("epoch")
+                loss_df = report_data.get("loss")
+                acc_df = report_data.get("accuracy")
+                action_df = report_data.get("action_taken") # This is the general action from end of epoch
+                
+                # Format loss and accuracy strings safely
+                loss_str = f"{loss_df:.4f}" if loss_df is not None else "N/A"
+                acc_str = f"{acc_df:.4f}" if acc_df is not None else "N/A"
+                action_str = action_df if action_df is not None else "N/A"
 
-        except Exception as e:
-            logger.error(f"Error processing Ray Train results: {e}. Check result structure.", exc_info=True)
+                if epoch_num_df is not None: # Ensure it's a valid epoch report
+                    logger.info(f"  Metrics DF (End of Epoch) - Worker [{worker_id_df}] Epoch [{epoch_num_df}]: Loss={loss_str}, Acc={acc_str}, Action={action_str}")
+    else:
+        logger.warning("No metrics dataframe found or it is empty.")
 
-    # Log findings
+    # Log findings from actual submissions (now populated from metrics_dataframe)
     if block_candidates:
-        logger.info(f"Found {len(block_candidates)} block candidates:")
+        logger.info(f"Found {len(block_candidates)} actual block candidates from worker reports:")
         for bc in block_candidates:
-            logger.info(f"  - CID: {bc['ipfs_cid']}, Accuracy: {bc['accuracy']:.4f}, Steps: {bc['steps']}")
+            logger.info(f"  - ModelCID: {bc['model_cid']}, TxHash: {bc['tx_hash']}, Accuracy: {bc['accuracy']:.4f}, Steps: {bc['total_steps_overall']}, Worker: {bc['worker_rank']}")
             # TODO: Add logic to select best block candidate and submit to blockchain
     else:
-        logger.info("No block candidates reported by workers.")
+        logger.info("No actual block candidates reported by workers.")
 
-    # Remove old simulated mempool addition
-    # if new_mtx_candidates:
-    #     logger.info(f"Found {len(new_mtx_candidates)} new mtx candidates to add to mempool:")
-    #     for mtx in new_mtx_candidates:
-    #         logger.info(f"  - CID: {mtx['ipfs_cid']}, Accuracy: {mtx['accuracy']:.4f}, Steps: {mtx['steps']}")
-    #         # Add to our simulated mempool (replace with actual mempool logic)
-    #         mtx_mempool.append(mtx) 
-    # else:
-    #     logger.info("No new mtx candidates reported by workers.")
+    if new_mtx_candidates:
+        logger.info(f"Found {len(new_mtx_candidates)} actual new MTX candidates from worker reports:")
+        for mtx in new_mtx_candidates:
+            logger.info(f"  - ModelCID: {mtx['model_cid']}, TxHash: {mtx['tx_hash']}, Accuracy: {mtx['accuracy']:.4f}, Steps: {mtx['total_steps_overall']}, Worker: {mtx['worker_rank']}")
+            # Add to our simulated mempool (replace with actual mempool logic)
+            # mtx_mempool.append(mtx) # Consider if mempool needs different structure
+    else:
+        logger.info("No actual new MTX candidates reported by workers.")
         
-    # logger.info(f"Current MTX Mempool size: {len(mtx_mempool)}")
+    # logger.info(f"Current MTX Mempool size: {len(mtx_mempool)}") # If using mtx_mempool
     # --- End Processing Results --- 
 
     # In a real system, run_training would be called again, potentially
@@ -227,17 +242,11 @@ def run_training(
 if __name__ == "__main__":
     logger.info("Running trainer script directly.")
     # Example local run with placeholder D-PoDL values
-    run_training(
-        num_workers=2,
-        epochs=5,
-        batch_size=128,
-        seq_len=128,
-        embed_dim=256,
-        num_heads=8,
-        num_layers=6,
-        checkpoint_path="checkpoint_dpodl.pt",
-        # Pass placeholder D-PoDL params for testing
-        prev_block_hash="0x1111",
-        t1_threshold=2**250, # Make it very easy for testing
-        t_acc_threshold=0.97 # Example Tacc for testing
-    )
+    # Parameters formerly passed here will now be fetched by get_config()
+    
+    # Allow overriding num_workers from CLI for convenience during testing
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-workers", type=int, help="Number of Ray workers")
+    args = parser.parse_args()
+
+    run_training(cli_num_workers=args.num_workers)

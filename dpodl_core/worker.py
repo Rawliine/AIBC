@@ -123,21 +123,28 @@ def worker_train_loop(config):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     worker_logger.info(f"Using device: {device}")
 
-    # Training params
+    # Fetch all parameters from the passed 'config' dictionary
     train_partition = config["train_partitions"][rank]
     val_partition = config["val_partition"]
     seq_len = config["seq_len"]
     batch_size = config["batch_size"]
     epochs = config["epochs"]
     lr = config["lr"]
-    # D-PoDL specific config
-    prev_block_hash = config.get("prev_block_hash", "0x0000")
-    reference_model_id = config.get("reference_model_id", None)
-    t1_threshold = config.get("t1_threshold", 2**256-1) # Default to max value (no threshold)
-    t2_threshold = config.get("t2_threshold", 2**256-1) # Default to max value
+    
+    # D-PoDL specific config from app_config (passed in trainer's train_loop_config)
+    prev_block_hash = config.get("prev_block_hash", "0x0000") # Default if somehow missing
+    reference_model_id = config.get("reference_model_id") # Should be None or a CID string
+    t1_threshold = config["t1_threshold"]
+    t2_threshold = config["t2_threshold"]
     checkpoint_path = config["checkpoint_path"]
-    t_acc_threshold = config.get("t_acc_threshold", 0.9999) # Extract Tacc, default high
-    transfer_reference_weights = config.get("transfer_reference_weights", False)
+    t_acc_threshold = config["t_acc_threshold"]
+    # transfer_reference_weights = config.get("transfer_reference_weights", False) # If you add this to config_utils
+    ipfs_enabled = config.get("ipfs_enabled", True) # Default to True if not in config
+    model_override_params = config.get("model_override_params")
+
+    worker_logger.info(f"IPFS Enabled: {ipfs_enabled}")
+    if model_override_params:
+        worker_logger.info(f"Using Model Override Params: {model_override_params}")
 
     # ===>>> Pre-Hash Stage (Finding Nonce) <<<===
     worker_logger.info(f"Starting Pre-Hash stage... Target T1: {t1_threshold}")
@@ -175,21 +182,31 @@ def worker_train_loop(config):
 
     # ===>>> Model Initialization using HtoA <<<===
     worker_logger.info("Initializing model based on Pre-Hash...")
-    derived_config = hash_to_architecture(pre_hash_value)
-    architecture_params = derived_config["architecture"]
-    seed_for_weights = derived_config["seed_for_weights"]
-    worker_logger.info(f"Derived architecture: {architecture_params}")
+    derived_config_htoa = hash_to_architecture(pre_hash_value)
+    architecture_params_htoa = derived_config_htoa["architecture"]
+    seed_for_weights = derived_config_htoa["seed_for_weights"]
+    
+    # Determine final architecture parameters (HtoA or Override)
+    final_architecture_params = architecture_params_htoa
+    if model_override_params: # If override params are provided in config
+        worker_logger.info(f"Overriding HtoA architecture with config: {model_override_params}")
+        final_architecture_params = model_override_params # Use override
+        # Note: seed_for_weights from HtoA might still be used unless override also specifies it
+    else:
+        worker_logger.info(f"Using HtoA derived architecture: {architecture_params_htoa}")
+
+    worker_logger.info(f"Final architecture for model: {final_architecture_params}")
     worker_logger.info(f"Seed for weight initialization: {seed_for_weights}")
 
-    # Instantiate the target model structure based on derived parameters
+    # Instantiate the target model structure based on final_architecture_params
     vocab_size = 30522 
     num_classes = 4
     model = DeeperTransformer(
         vocab_size=vocab_size,
-        embed_dim=architecture_params["embed_dim"],
-        seq_len=seq_len, 
-        num_heads=architecture_params["num_heads"],
-        num_layers=architecture_params["num_layers"],
+        embed_dim=final_architecture_params["embed_dim"],
+        seq_len=seq_len, # Use seq_len from config
+        num_heads=final_architecture_params["num_heads"],
+        num_layers=final_architecture_params["num_layers"],
         num_classes=num_classes
     ).to(device)
     worker_logger.info(f"Target model structure instantiated on device {device}.")
@@ -219,19 +236,24 @@ def worker_train_loop(config):
     reference_model_state = None
     if reference_model_id:
         worker_logger.info(f"Loading reference model state from IPFS: {reference_model_id}")
-        reference_model_state = load_model_state_from_ipfs(reference_model_id, "reference_model")
-        # --- Added Failure Check --- 
-        if reference_model_state is None:
-            worker_logger.error(f"CRITICAL: Failed to load reference model {reference_model_id} from IPFS. Continuing without reference weights.")
-            # In a stricter setup, this might warrant raising an error or stopping the worker.
-            # For now, we just log and proceed without transfer/comparison.
-            reference_model_id = None # Clear reference ID to prevent further use attempts
-        
-        elif transfer_reference_weights:
-            worker_logger.info("Transferring weights from reference model.")
-            transfer_weights(model, reference_model_state)
+        if not ipfs_enabled:
+            worker_logger.warning("IPFS is disabled in config, cannot load reference model from IPFS. Skipping.")
+            reference_model_state = None
+            reference_model_id = None # Ensure it's cleared if not loadable
         else:
-            worker_logger.info("Reference model loaded, but weight transfer is disabled.")
+            reference_model_state = load_model_state_from_ipfs(reference_model_id, "reference_model")
+            # --- Added Failure Check --- 
+            if reference_model_state is None:
+                worker_logger.error(f"CRITICAL: Failed to load reference model {reference_model_id} from IPFS. Continuing without reference weights.")
+                # In a stricter setup, this might warrant raising an error or stopping the worker.
+                # For now, we just log and proceed without transfer/comparison.
+                reference_model_id = None # Clear reference ID to prevent further use attempts
+            
+            elif transfer_reference_weights:
+                worker_logger.info("Transferring weights from reference model.")
+                transfer_weights(model, reference_model_state)
+            else:
+                worker_logger.info("Reference model loaded, but weight transfer is disabled.")
 
     # --- Deterministic Weight Initialization (if reference loading failed or wasn't used) ---
     if not reference_model_state:
@@ -301,6 +323,7 @@ def worker_train_loop(config):
     steps_this_run = 0
     checkpoint_hashes = OrderedDict() # Store {step: hash_bytes} for Merkle tree
     training_trace = [] # List to store trace records for this run
+    # worker_submissions = [] # REMOVED: List to store submission details for this worker
 
     # Load previous checkpoint hashes if resuming
     if loaded_dpodl_state.get('checkpoint_hashes'):
@@ -414,7 +437,7 @@ def worker_train_loop(config):
             worker_logger.info(f"Built Merkle tree with {len(leaf_hashes)} leaves. Root: {merkle_root_hex[:10]}...")
 
             # Build complete D-PoDL state for verification
-            current_dpodl_state = {
+            current_dpodl_state_for_verification = { # Renamed to avoid conflict if needed later
                 'prev_block_hash': prev_block_hash,
                 'nonce': nonce,
                 'reference_model_id': reference_model_id,
@@ -433,7 +456,7 @@ def worker_train_loop(config):
             
             # Perform comprehensive D-PoDL state verification
             worker_logger.info("Performing D-PoDL state consistency verification...")
-            is_state_consistent = verify_proof_of_training_consistency(current_dpodl_state)
+            is_state_consistent = verify_proof_of_training_consistency(current_dpodl_state_for_verification)
             if not is_state_consistent:
                 worker_logger.error("D-PoDL state consistency verification FAILED! Aborting submission.")
                 action = "DISCARD"  # Force discard if verification fails
@@ -451,6 +474,10 @@ def worker_train_loop(config):
                 action = "DISCARD"
 
             worker_logger.info(f"Post-Epoch Action Decision: {action} (PostHash Valid: {is_post_hash_valid}, Accuracy: {accuracy:.4f} >= Tacc: {t_acc_threshold:.4f}, State Consistent: {is_state_consistent})")
+            
+            # Variables to store details for submission_record
+            submitted_model_cid_for_record = None
+            tx_hash_for_record = None
                 
             if action in ["SAVE_BLOCK_CHECKPOINT", "SAVE_MTX_CHECKPOINT"]:
                 # --- Save Training Trace & Calculate Hash --- 
@@ -503,44 +530,62 @@ def worker_train_loop(config):
                 worker_logger.info(f"Saving checkpoint for {checkpoint_type}...")
 
                 # --- Save Checkpoint (potentially getting IPFS CID) ---
-                ipfs_cid = save_checkpoint(
+                # Respect ipfs_enabled flag for actual upload
+                actual_ipfs_upload = ipfs_enabled 
+                ipfs_cid_from_save = save_checkpoint(
                     epoch + 1, model, optimizer, epoch_loss, 
                     checkpoint_path, 
-                    dpodl_state=current_dpodl_state
+                    dpodl_state=current_dpodl_state,
+                    upload_to_ipfs_flag=actual_ipfs_upload # Pass the flag
                 )
-                worker_logger.info(f"Checkpoint saved. Type: {checkpoint_type}. IPFS CID (if IPFS running): {ipfs_cid}")
+                if actual_ipfs_upload:
+                    worker_logger.info(f"Checkpoint saved. Type: {checkpoint_type}. IPFS CID: {ipfs_cid_from_save}")
+                else:
+                    worker_logger.info(f"Checkpoint saved locally. Type: {checkpoint_type}. IPFS upload disabled.")
+                    ipfs_cid_from_save = f"DUMMY_LOCAL_SAVE_NO_IPFS_{rank}_{epoch}" # Placeholder if IPFS is off
                 
                 # ===>>> Submit Result to Blockchain <<<===
                 submission_receipt = None
-                if ipfs_cid: # Only submit if we have an IPFS CID for the checkpoint
+                # Only proceed with IPFS-dependent submission if IPFS was enabled and we got a real CID
+                # However, the user wants IPFS to be active for test, so ipfs_enabled should be true.
+                # The dummy CID logic for ipfs_cid_from_save when ipfs_enabled=False is more for a scenario
+                # where one might want to test the flow without IPFS at all.
+                # Given current request (IPFS always on), we rely on ipfs_cid_from_save being a real CID.
+
+                if ipfs_cid_from_save and not ipfs_cid_from_save.startswith("DUMMY_LOCAL_SAVE"):
                     if action == "SAVE_BLOCK_CHECKPOINT":
                         worker_logger.info("ACTION: Preparing to submit BLOCK checkpoint.")
-                        # Save final model and checkpoint data to IPFS
-                        final_model_cid = None
-                        checkpoint_data_cid = None
-                        try:
-                            # Use asyncio.run() to call the async IPFS functions
-                            final_model_cid = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_block_{current_dpodl_state['steps_at_checkpoint']}"))
-                            checkpoint_data_cid = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_block_{current_dpodl_state['steps_at_checkpoint']}"))
-                        except Exception as ipfs_err:
-                             worker_logger.error(f"Error saving data to IPFS before block submission: {ipfs_err}", exc_info=True)
+                        final_model_cid_for_tx = None # Renamed to avoid confusion
+                        checkpoint_data_cid_for_tx = None # Renamed
+                        if not ipfs_enabled:
+                            worker_logger.warning("IPFS is disabled. Cannot save model/checkpoint data to IPFS for block submission. Generating dummy CIDs.")
+                            final_model_cid_for_tx = f"DUMMY_MODEL_CID_BLOCK_{current_dpodl_state['steps_at_checkpoint']}"
+                            checkpoint_data_cid_for_tx = f"DUMMY_DATA_CID_BLOCK_{current_dpodl_state['steps_at_checkpoint']}"
+                        else:
+                            try:
+                                final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_block_{current_dpodl_state['steps_at_checkpoint']}"))
+                                checkpoint_data_cid_for_tx = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_block_{current_dpodl_state['steps_at_checkpoint']}"))
+                            except Exception as ipfs_err:
+                                 worker_logger.error(f"Error saving data to IPFS before block submission: {ipfs_err}", exc_info=True)
 
-                        if final_model_cid and checkpoint_data_cid:
-                            worker_logger.info(f"IPFS Save Complete: Model CID: {final_model_cid}, Checkpoint Data CID: {checkpoint_data_cid}")
+                        if final_model_cid_for_tx and checkpoint_data_cid_for_tx:
+                            worker_logger.info(f"IPFS Save Complete: Model CID: {final_model_cid_for_tx}, Checkpoint Data CID: {checkpoint_data_cid_for_tx}")
+                            submitted_model_cid_for_record = final_model_cid_for_tx # Capture for submission record
                             # Submit to blockchain
                             try:
                                 receipt = submit_block(
-                                    cid=final_model_cid, # Use the actual model CID
+                                    cid=final_model_cid_for_tx, # Use the actual model CID
                                     accuracyBPS=int(accuracy * 10000), # Convert accuracy to BPS
                                     steps=int(current_dpodl_state['steps_at_checkpoint']),
                                     t1_hash=current_dpodl_state['post_hash_value'], # Already a hex string
                                     reference_cid=current_dpodl_state['reference_model_id'] if current_dpodl_state['reference_model_id'] else "", # Handle None case
                                     merkle_root=current_dpodl_state['merkle_root'],
-                                    checkpoint_data_cid=checkpoint_data_cid
+                                    checkpoint_data_cid=checkpoint_data_cid_for_tx
                                 )
                                 submission_receipt = receipt # Assign the result to submission_receipt
                                 if receipt:
                                     worker_logger.info(f"Block submitted successfully! Tx Hash: {receipt.transactionHash.hex()}")
+                                    tx_hash_for_record = receipt.transactionHash.hex() # Capture for submission record
                                 else:
                                     worker_logger.error("CRITICAL: Block submission failed (receipt is None).")
                                     # TODO: Implement retry or failure handling
@@ -552,31 +597,36 @@ def worker_train_loop(config):
                             # TODO: Implement retry or failure handling
                     elif action == "SAVE_MTX_CHECKPOINT":
                         worker_logger.info("ACTION: Preparing to submit MTX checkpoint.")
-                        # Save final model and checkpoint data to IPFS
-                        final_model_cid = None
-                        checkpoint_data_cid = None
-                        try:
-                            # Use asyncio.run() to call the async IPFS functions
-                            final_model_cid = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
-                            checkpoint_data_cid = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
-                        except Exception as ipfs_err:
-                             worker_logger.error(f"Error saving data to IPFS before MTX submission: {ipfs_err}", exc_info=True)
+                        final_model_cid_for_tx = None # Renamed
+                        checkpoint_data_cid_for_tx = None # Renamed
+                        if not ipfs_enabled:
+                            worker_logger.warning("IPFS is disabled. Cannot save model/checkpoint data to IPFS for MTX submission. Generating dummy CIDs.")
+                            final_model_cid_for_tx = f"DUMMY_MODEL_CID_MTX_{current_dpodl_state['steps_at_checkpoint']}"
+                            checkpoint_data_cid_for_tx = f"DUMMY_DATA_CID_MTX_{current_dpodl_state['steps_at_checkpoint']}"
+                        else:
+                            try:
+                                final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
+                                checkpoint_data_cid_for_tx = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
+                            except Exception as ipfs_err:
+                                 worker_logger.error(f"Error saving data to IPFS before MTX submission: {ipfs_err}", exc_info=True)
 
-                        if final_model_cid and checkpoint_data_cid:
-                            worker_logger.info(f"IPFS Save Complete: Model CID: {final_model_cid}, Checkpoint Data CID: {checkpoint_data_cid}")
+                        if final_model_cid_for_tx and checkpoint_data_cid_for_tx:
+                            worker_logger.info(f"IPFS Save Complete: Model CID: {final_model_cid_for_tx}, Checkpoint Data CID: {checkpoint_data_cid_for_tx}")
+                            submitted_model_cid_for_record = final_model_cid_for_tx # Capture for submission record
                             # Submit to MTX mempool
                             try:
                                 # Corrected call to submit_mtx with required arguments
                                 receipt = submit_mtx(
-                                    ipfs_cid=final_model_cid, # Correct parameter name
+                                    ipfs_cid=final_model_cid_for_tx, # Correct parameter name
                                     accuracy_bps=int(accuracy * 10000), # Renamed for clarity
                                     steps=int(current_dpodl_state['steps_at_checkpoint']),
                                     reference_cid=current_dpodl_state['reference_model_id'] if current_dpodl_state['reference_model_id'] else "",
                                     signer_private_key=worker_private_key # Pass the loaded private key
-                        )
+                                )
                                 submission_receipt = receipt # Assign the result to submission_receipt
                                 if receipt:
                                     worker_logger.info(f"MTX submitted successfully! Tx Hash: {receipt.transactionHash.hex()}")
+                                    tx_hash_for_record = receipt.transactionHash.hex() # Capture for submission record
                                 else:
                                     worker_logger.error("CRITICAL: MTX submission failed (receipt is None).")
                                     # TODO: Implement retry or failure handling
@@ -587,16 +637,27 @@ def worker_train_loop(config):
                             worker_logger.error("CRITICAL: Failed to save model or checkpoint data to IPFS. Cannot submit MTX.")
                             # TODO: Implement retry or failure handling
                     
-                    # Log submission result
-                    if submission_receipt:
-                        worker_logger.info(f"Blockchain submission SUCCESSFUL for {action}. Tx: {submission_receipt.transactionHash.hex()}")
+                    # Log submission result and add to worker_submissions list
+                    if submission_receipt: # This means tx_hash_for_record should be set
+                        worker_logger.info(f"Blockchain submission SUCCESSFUL for {action}. Tx: {tx_hash_for_record}")
+                        if submitted_model_cid_for_record and tx_hash_for_record:
+                            # REPLACED worker_submissions.append with report()
+                            submission_details_for_report = {
+                                "is_submission_report": True, # Flag to identify this report
+                                "submission_epoch": epoch,
+                                "submission_action": action,
+                                "submission_model_cid": submitted_model_cid_for_record,
+                                "submission_tx_hash": tx_hash_for_record,
+                                "submission_accuracy": accuracy,
+                                "submission_total_steps": current_total_steps,
+                                "submission_worker_rank": rank
+                            }
+                            report(submission_details_for_report)
+                            worker_logger.info(f"Reported submission to Ray Train (Worker {rank}, Epoch {epoch}): {submission_details_for_report}")
+                        else:
+                            worker_logger.warning(f"Could not report submission for {action} due to missing model_cid or tx_hash.")
                     else:
-                        worker_logger.error(f"Blockchain submission FAILED for {action} (CID: {ipfs_cid}). Check logs.")
-                        # How should failure be handled? Continue? Stop worker?
-                        # For now, just log the error.
-
-                else:
-                    worker_logger.warning(f"Skipping blockchain submission for {action} because IPFS CID is missing.")
+                        worker_logger.error(f"Blockchain submission FAILED for {action} (Model CID for TX: {submitted_model_cid_for_record if submitted_model_cid_for_record else 'N/A'}). Check logs.")
                 # ===>>> End Blockchain Submission <<<===
                 
                 # Clean up trace file if it was temporary and hashing was successful
@@ -619,6 +680,24 @@ def worker_train_loop(config):
 
             # Update total steps for next epoch calculation (only if checkpoint wasn't saved? No, update regardless)
             total_steps_so_far = current_total_steps 
+
+            # ===>>> Report Metrics to Ray Train <<<===
+            metrics_to_report = {
+                "epoch": epoch,
+                "loss": epoch_loss,
+                "accuracy": accuracy,
+                "steps_this_epoch": steps_this_epoch,
+                "total_steps_overall": current_total_steps,
+                "action_taken": action,
+                "post_hash_valid": is_post_hash_valid,
+                "state_consistent": is_state_consistent
+            }
+            if submission_receipt and hasattr(submission_receipt, 'transactionHash'):
+                metrics_to_report["last_tx_hash"] = submission_receipt.transactionHash.hex()
+            
+            report(metrics_to_report)
+            worker_logger.info(f"Reported metrics for epoch {epoch} to Ray Train: {metrics_to_report}")
+            # ===>>> End Report Metrics <<<===
                 
     except Exception as e:
         worker_logger.error(f"Worker crashed during training loop: {e}", exc_info=True)
@@ -645,6 +724,8 @@ def worker_train_loop(config):
             leaf_hashes = list(checkpoint_hashes.values())
             merkle_root, _ = build_merkle_tree(leaf_hashes)
             merkle_root_hex = bytes_to_hex(merkle_root)
+            # Determine IPFS upload flag for emergency save
+            emergency_upload_to_ipfs = ipfs_enabled
 
             emergency_dpodl_state = {
                 'prev_block_hash': prev_block_hash, # Explicitly add prev_block_hash
@@ -662,8 +743,14 @@ def worker_train_loop(config):
                 'trace_file_path': emergency_trace_file_path # Add trace path if available
             }
             emergency_cid = save_checkpoint(current_epoch, model, optimizer, epoch_loss,
-                                          f"emergency_{checkpoint_path}", dpodl_state=emergency_dpodl_state)
-            worker_logger.info(f"Emergency checkpoint saved. IPFS CID (if IPFS running): {emergency_cid}")
+                                          f"emergency_{checkpoint_path}", 
+                                          dpodl_state=emergency_dpodl_state,
+                                          upload_to_ipfs_flag=emergency_upload_to_ipfs
+                                          )
+            if emergency_upload_to_ipfs:
+                worker_logger.info(f"Emergency checkpoint saved. IPFS CID: {emergency_cid}")
+            else:
+                worker_logger.info(f"Emergency checkpoint saved locally. IPFS upload disabled.")
             # Clean up emergency trace file only if checkpoint saving succeeded
             if emergency_trace_file_path and os.path.exists(emergency_trace_file_path):
                  try:
@@ -676,3 +763,5 @@ def worker_train_loop(config):
         raise # Re-raise the original exception that caused the crash
 
     worker_logger.info(f"Training complete.")
+    # return worker_submissions # REMOVED: Return the list of submissions
+    return None # Explicitly return None or a status if needed

@@ -46,13 +46,13 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     loss: float,
     checkpoint_path: str,
-    # D-PoDL specific state to save
-    dpodl_state: dict = None 
+    dpodl_state: dict = None,
+    upload_to_ipfs_flag: bool = True # New flag to control IPFS upload
 ):
     """
     Saves a training checkpoint locally.
     Includes model state, optimizer state, epoch, loss, and D-PoDL state.
-    NOTE: IPFS saving logic is here but will fail if daemon isn't running.
+    Optionally uploads to IPFS based on upload_to_ipfs_flag.
     
     Args:
         epoch: Current epoch number (to be saved).
@@ -60,12 +60,11 @@ def save_checkpoint(
         optimizer: The optimizer instance.
         loss: The loss value for this epoch/checkpoint.
         checkpoint_path: Local path to save the checkpoint file.
-        dpodl_state: Dictionary containing D-PoDL context 
-                     (e.g., {'nonce', 'pre_hash_value', 'reference_model_id',
-                      'random_seed', 'seed_for_weights', 't1_threshold', 't2_threshold'}).
+        dpodl_state: Dictionary containing D-PoDL context.
+        upload_to_ipfs_flag: Boolean indicating whether to upload to IPFS.
                       
     Returns:
-        IPFS CID if upload is successful, otherwise None.
+        IPFS CID if upload is attempted and successful, otherwise local path or None on error.
     """
     state = {
         "epoch": epoch,
@@ -87,34 +86,37 @@ def save_checkpoint(
         logger.error(f"Failed to save checkpoint locally to {checkpoint_path}: {e}", exc_info=True)
         return None # Indicate failure
 
-    # --- IPFS Upload (Optional) ---
+    # --- IPFS Upload (Conditional) ---
     ipfs_cid = None
-    try:
-        # Attempt connection within the function - less efficient but self-contained
-        client = ipfshttpclient.connect('/ip4/127.0.0.1/tcp/5001', timeout=5) # Add timeout
-        # Quick check
-        client.version() 
-        
-        # Add the file to IPFS
-        res = client.add(checkpoint_path)
-        ipfs_cid = res['Hash']
-        logger.info(f"Checkpoint uploaded to IPFS. CID: {ipfs_cid}")
-        
-        # Optional: Record CID locally
-        # Consider a more robust tracking mechanism than a simple text file
+    if upload_to_ipfs_flag:
         try:
-            with open('checkpoint_cids.txt', 'a') as f:
-                f.write(f"{epoch},{ipfs_cid},{checkpoint_path}\n")
-        except Exception as f_err:
-            logger.warning(f"Failed to write CID to checkpoint_cids.txt: {f_err}")
+            client = ipfshttpclient.connect('/ip4/127.0.0.1/tcp/5001', timeout=5)
+            client.version() 
             
-    except ipfshttpclient.exceptions.ConnectionError:
-        logger.warning(f"IPFS connection failed (daemon not running?). Checkpoint CID not generated for {checkpoint_path}.")
-    except Exception as e:
-        logger.error(f"An error occurred during IPFS upload for {checkpoint_path}: {e}")
+            res = client.add(checkpoint_path)
+            ipfs_cid = res['Hash']
+            logger.info(f"Checkpoint uploaded to IPFS. CID: {ipfs_cid}")
+            
+            try:
+                with open('checkpoint_cids.txt', 'a') as f:
+                    f.write(f"{epoch},{ipfs_cid},{checkpoint_path}\n")
+            except Exception as f_err:
+                logger.warning(f"Failed to write CID to checkpoint_cids.txt: {f_err}")
+                
+        except ipfshttpclient.exceptions.ConnectionError:
+            logger.warning(f"IPFS connection failed (daemon not running?). Checkpoint CID not generated for {checkpoint_path}.")
+            # Return local path if IPFS fails but local save worked
+            return checkpoint_path # Or None, depending on desired behavior on IPFS fail
+        except Exception as e:
+            logger.error(f"An error occurred during IPFS upload for {checkpoint_path}: {e}")
+            # Return local path if IPFS fails
+            return checkpoint_path # Or None
+    else:
+        logger.info(f"IPFS upload skipped for {checkpoint_path} as per configuration.")
+        # Return local path when IPFS is skipped but local save was successful
+        return checkpoint_path 
         
-    # Return CID if successful, otherwise None
-    return ipfs_cid 
+    return ipfs_cid if ipfs_cid else checkpoint_path # Ensure we return CID if available, else local path
 
 def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     """

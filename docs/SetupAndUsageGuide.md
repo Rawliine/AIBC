@@ -36,6 +36,8 @@ This guide provides instructions for setting up and running the D-PoDL project f
 
 ## 3. Running Local Dependencies (Order Matters!)
 
+This section details the components that need to be running. For a concise typical workflow, see Section 7.
+
 ### Step 1: Start IPFS Daemon
 
 Initialize and start the IPFS daemon (if not already initialized):
@@ -46,14 +48,26 @@ ipfs daemon
 
 ### Step 2: Deploy Blockchain Contracts (if needed)
 
-Compile and deploy contracts to the local Hardhat network:
+For local development, you'll start a local Hardhat node and deploy your contracts to it.
+
+**1. Start Hardhat Node (in a separate terminal):**
+Navigate to the `blockchain/` directory and run:
 ```bash
 cd blockchain
 npx hardhat node
+```
+**Important:** Keep this terminal window open.
+
+**2. Compile and Deploy Contracts (in another terminal):**
+Navigate to the `blockchain/` directory (if not already there) and run:
+```bash
+cd blockchain
 npx hardhat compile
 npx hardhat deploy --network hardhat
-cd ..
+cd .. 
 ```
+This deploys to the `hardhat` network which the `npx hardhat node` command just started.
+The `cd ..` returns you to the project root.
 
 ## 4. Running the D-PoDL System
 
@@ -61,6 +75,32 @@ Run the Python trainer module from the project root. This will automatically sta
 ```bash
 python -m dpodl_core.trainer
 ```
+
+**Note on Environment Profiles:**
+The system supports different environment profiles using the `DPODL_ENV` environment variable:
+*   **`dev` (default if `DPODL_ENV` is not set or set to `dev`):** Uses the standard, full configurations for dataset size, model complexity, etc.
+*   **`test`:** Uses a "tiny" dataset and simplified model parameters for significantly faster execution, ideal for local development, quick tests, and debugging.
+
+To run with the **test environment**:
+1.  Ensure you have created the tiny dataset (see Section 4.1).
+2.  Set the environment variable in your terminal:
+    ```bash
+    export DPODL_ENV=test
+    ```
+3.  Then run the trainer:
+    ```bash
+    python -m dpodl_core.trainer
+    ```
+
+### 4.1. Creating the Tiny Dataset (for Test Environment)
+
+The `test` environment relies on a small version of the AG News dataset. To generate this:
+1.  Navigate to the project root directory.
+2.  Run the script:
+    ```bash
+    python scripts/create_tiny_dataset.py
+    ```
+    This will create the necessary data files in `./data/ag_news_tiny/`. This step only needs to be done once.
 
 ## 5. Monitoring and Troubleshooting
 
@@ -85,21 +125,35 @@ cd ..
 
 ## 7. Typical Workflow Summary
 
-1. **Start IPFS daemon:**
-   ```bash
-   ipfs daemon
-   ```
-2. **Deploy contracts :**
-   ```bash
-   cd blockchain && npx hardhat node
-   cd blockchain && npx hardhat compile && npx hardhat deploy --network hardhat && cd ..
-   ```
-3. **Run the trainer:**
-   ```bash
-   python -m dpodl_core.trainer
-   ```
+These are the essential steps to run the D-PoDL system for typical local development after initial setup:
 
-This order ensures all dependencies are available and avoids connection errors. Adjust IP addresses and ports as needed for your environment.
+1.  **Start IPFS Daemon (if not already running):**
+    Open a terminal and run:
+    ```bash
+    ipfs daemon
+    ```
+
+2.  **Start Local Blockchain Node & Deploy Contracts:**
+    *   **Terminal 1 (Blockchain Node):**
+        ```bash
+        cd blockchain
+        npx hardhat node
+        ```
+        (Keep this running)
+    *   **Terminal 2 (Deploy Contracts):**
+        ```bash
+        cd blockchain
+        npx hardhat compile && npx hardhat deploy --network hardhat
+        cd ..
+        ```
+
+3.  **Run the D-PoDL Trainer (from project root):**
+    Open another terminal (or use one where you ran contract deployment) and ensure you are in the project root directory:
+    ```bash
+    python -m dpodl_core.trainer
+    ```
+
+This order ensures all dependencies are available.
 
 ## 8. Project Structure Overview
 
@@ -117,44 +171,8 @@ This order ensures all dependencies are available and avoids connection errors. 
     *   `crypto.py`: D-PoDL cryptographic logic.
     *   `models.py`: PyTorch model definition.
     *   `data_loader.py`: Data loading and preprocessing.
+    *   `config_utils.py`: Manages loading of environment-specific configurations.
 *   `docs/`: Project documentation.
 *   `tests/`: Python unit and integration tests.
+*   `scripts/`: Helper scripts (e.g., for dataset creation).
 *   `requirements.txt`: Python dependencies.
-*   `package.json`: Node.js dependencies (for `blockchain/` primarily).
-*   `.gitignore`: Files and directories to ignore in Git.
-*   `README.md`: Main project overview.
-
-## 9. Common Issues & Troubleshooting
-
-*   **Python Dependencies:** Ensure `pip install -r requirements.txt` completes successfully in your virtual environment.
-*   **Node.js Dependencies:** Ensure `npm install` in `blockchain/` completes.
-*   **Docker Services:** Check `docker ps` to ensure Ganache and IPFS containers are running. View logs with `docker-compose logs <service_name>`.
-*   **Hardhat Deployment:** Verify network names in `hardhat.config.js` and the `--network` flag match. Check Ganache logs for deployment transactions.
-*   **Ray Connection:** Ensure `ray start --head` is running. The trainer script needs the correct Ray head address.
-*   **IPFS Daemon:** Make sure the IPFS daemon is running and accessible on the configured API port (usually 5001).
-*   **Private Keys/RPC URLs:** Double-check that private keys (for contract deployment and interaction) and RPC URLs are correct and have funds if needed.
-
-## 10. Environment Configuration
-
-Ensure your `.env` file in the project root is correctly configured. Each Ray worker requires its own unique private key for signing blockchain transactions. If you are running `N` workers, you need to define `WORKER_PRIVATE_KEY_0` through `WORKER_PRIVATE_KEY_N-1`.
-
-**Example for 2 workers:**
-```
-BLOCKCHAIN_NETWORK_URL="http://127.0.0.1:8545"
-BLOCKCHAIN_CHAIN_ID="31337"
-BLOCKCHAIN_NETWORK_NAME="localhost"
-
-# Private key for Worker 0 (e.g., Hardhat Account #1)
-WORKER_PRIVATE_KEY_0="0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-
-# Private key for Worker 1 (e.g., Hardhat Account #2)
-WORKER_PRIVATE_KEY_1="0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
-
-# Fallback/Test key for direct script runs (if any still use it, like blockchain_interface.py direct test)
-TEST_WORKER_PRIVATE_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" # Example: Hardhat Account #0
-```
-
-*   **`WORKER_PRIVATE_KEY_X`**: The private key for worker with rank `X`. These should be distinct for each worker to avoid nonce conflicts.
-*   **`TEST_WORKER_PRIVATE_KEY`**: This might be used by standalone test scripts or direct runs of `blockchain_interface.py`. Ensure it's different from worker keys if used concurrently.
-
-This guide should help you get the D-PoDL project up and running locally. For more detailed information on specific components, refer to their respective documentation or the `docs/architecture.md` file. 
