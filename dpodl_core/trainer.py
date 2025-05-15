@@ -16,6 +16,7 @@ from .data_loader import load_dataset_and_partition
 from .worker import worker_train_loop  # Import the worker loop
 from .utils import logger # Import logger if configured globally
 # Import the blockchain interface functions
+from . import blockchain_interface
 from .blockchain_interface import (
     get_current_reference_model_state_cid, 
     get_current_reference_dpodl_checkpoint_cid,
@@ -196,7 +197,7 @@ def run_training(
     new_mtx_candidates = []
 
     # --- Process Metrics Dataframe for General Progress AND Submissions ---
-            if result.metrics_dataframe is not None and not result.metrics_dataframe.empty:
+    if result.metrics_dataframe is not None and not result.metrics_dataframe.empty:
         logger.info("Processing results from metrics_dataframe...")
         for index, report_data in result.metrics_dataframe.iterrows():
             worker_id_df = report_data.get("pid", report_data.get("hostname", f"worker_{report_data.get('trial_id', 'unknown')}"))
@@ -231,8 +232,8 @@ def run_training(
 
                 if epoch_num_df is not None: # Ensure it's a valid epoch report
                     logger.info(f"  Metrics DF (End of Epoch) - Worker [{worker_id_df}] Epoch [{epoch_num_df}]: Loss={loss_str}, Acc={acc_str}, Action={action_str}")
-            else:
-                 logger.warning("No metrics dataframe found or it is empty.")
+    else:
+        logger.warning("No metrics dataframe found or it is empty.")
 
     # Log findings from actual submissions (now populated from metrics_dataframe)
     if block_candidates:
@@ -314,41 +315,52 @@ def run_training(
                 logger.info(f"Extracted Model State CID for submission: {model_state_cid_to_submit} from DPoDL Checkpoint {dpodl_checkpoint_cid_to_submit}")
                 
                 # --- DEBUGGING: Check mtxMempoolContract address in ModelRegistry ---
-                from . import blockchain_interface # Ensure module is loaded for direct call
-                try:
-                    logger.info("DEBUG: Querying ModelRegistry for its mtxMempoolContract address...")
-                    mempool_addr_in_registry = blockchain_interface.get_model_registry_mempool_address()
-                    logger.info(f"DEBUG: MTXMempool address set in ModelRegistry: {mempool_addr_in_registry}")
-                    # You might also want to log the expected address from your deployments
-                    # e.g., expected_mempool_address = blockchain_interface.get_mempool().address
-                    # logger.info(f"DEBUG: Expected MTXMempool address: {expected_mempool_address}")
-                    # if mempool_addr_in_registry != expected_mempool_address:
-                    #     logger.warning("DEBUG: Mismatch between expected and actual MTXMempool address in ModelRegistry!")
-                except Exception as e_debug_addr:
-                    logger.error(f"DEBUG: Error querying mtxMempoolContract address from ModelRegistry: {e_debug_addr}")
+                # from . import blockchain_interface # Ensure module is loaded for direct call
+                # try:
+                #     logger.info("DEBUG: Querying ModelRegistry for its mtxMempoolContract address...")
+                #     mempool_addr_in_registry = blockchain_interface.get_model_registry_mempool_address()
+                #     logger.info(f"DEBUG: MTXMempool address set in ModelRegistry: {mempool_addr_in_registry}")
+                # except Exception as e_debug_addr:
+                #     logger.error(f"DEBUG: Error querying mtxMempoolContract address from ModelRegistry: {e_debug_addr}")
                 # --- END DEBUGGING ---
 
                 signer_private_key = os.getenv("REGISTRY_OPERATOR_PRIVATE_KEY")
                 if not signer_private_key:
                     logger.error("REGISTRY_OPERATOR_PRIVATE_KEY not found in environment. Cannot submit MTX update to ModelRegistry.")
                 else:
-                    logger.info(f"Calling ModelRegistry to update with MTX ID {mtx_id_to_submit}, Model State CID {model_state_cid_to_submit}, DPoDL Checkpoint CID {dpodl_checkpoint_cid_to_submit}")
-                    update_receipt = update_reference_model_from_mtx(
-                        model_state_cid=model_state_cid_to_submit,
-                        dpodl_checkpoint_cid=dpodl_checkpoint_cid_to_submit,
+                    # --->>> NEW: Update MTX status to SelectedForProcessing <<<---
+                    logger.info(f"Attempting to update status of MTX ID {mtx_id_to_submit} to 'SelectedForProcessing' (1) in MTXMempool...")
+                    status_update_receipt = blockchain_interface.update_mtx_status(
                         mtx_id=mtx_id_to_submit,
+                        status_code=1,  # 1 for MTXMempool.Status.SelectedForProcessing
                         signer_private_key=signer_private_key
                     )
 
-                    if update_receipt and update_receipt.get("status") == 1:
-                        tx_hash = update_receipt.get("tx_hash")
-                        logger.info(f"Successfully updated ModelRegistry with MTX ID {mtx_id_to_submit}. TxHash: {tx_hash}")
-                        # Optionally, re-fetch and log the new global CIDs to confirm
-                        new_global_model_state = get_current_reference_model_state_cid()
-                        new_global_dpodl_checkpoint = get_current_reference_dpodl_checkpoint_cid()
-                        logger.info(f"New global reference model state CID: {new_global_model_state}, DPoDL checkpoint CID: {new_global_dpodl_checkpoint}")
+                    if status_update_receipt and status_update_receipt.get("status") == 1:
+                        logger.info(f"Successfully updated status for MTX ID {mtx_id_to_submit} to SelectedForProcessing. Tx: {status_update_receipt.get('tx_hash')}")
+                        
+                        # Now proceed to call ModelRegistry
+                        logger.info(f"Calling ModelRegistry to update with MTX ID {mtx_id_to_submit}, Model State CID {model_state_cid_to_submit}, DPoDL Checkpoint CID {dpodl_checkpoint_cid_to_submit}")
+                        update_receipt = update_reference_model_from_mtx(
+                            model_state_cid=model_state_cid_to_submit,
+                            dpodl_checkpoint_cid=dpodl_checkpoint_cid_to_submit,
+                            mtx_id=mtx_id_to_submit,
+                            signer_private_key=signer_private_key
+                        )
+
+                        if update_receipt and update_receipt.get("status") == 1:
+                            tx_hash = update_receipt.get("tx_hash")
+                            logger.info(f"Successfully updated ModelRegistry with MTX ID {mtx_id_to_submit}. TxHash: {tx_hash}")
+                            # Optionally, re-fetch and log the new global CIDs to confirm
+                            new_global_model_state = get_current_reference_model_state_cid()
+                            new_global_dpodl_checkpoint = get_current_reference_dpodl_checkpoint_cid()
+                            logger.info(f"New global reference model state CID: {new_global_model_state}, DPoDL checkpoint CID: {new_global_dpodl_checkpoint}")
+                        else:
+                            logger.error(f"Failed to update ModelRegistry with MTX ID {mtx_id_to_submit}. Receipt: {update_receipt}")
+                            # Consider if we need to revert the status of MTX ID {mtx_id_to_submit} back to Pending or mark as Rejected
+                            # For now, it will remain SelectedForProcessing but not processed by ModelRegistry.
                     else:
-                        logger.error(f"Failed to update ModelRegistry with MTX ID {mtx_id_to_submit}. Receipt: {update_receipt}")
+                        logger.error(f"FAILED to update status for MTX ID {mtx_id_to_submit} to SelectedForProcessing. Receipt: {status_update_receipt}. ModelRegistry update will not be attempted.")
             else:
                 logger.error(f"Could not find 'final_model_state_cid' (or similar) in DPoDL state for MTX ID {mtx_id_to_submit} (DPoDL CID: {dpodl_checkpoint_cid_to_submit}). Cannot update ModelRegistry.")
         else:

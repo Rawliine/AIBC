@@ -279,16 +279,31 @@ def _send_signed_transaction(w3_instance, chain_id, transaction, private_key):
             logger.debug(f"Attempting eth_call for transaction: {transaction}")
             # For eth_call, we don't need nonce, gas, maxFeePerGas, maxPriorityFeePerGas yet.
             # A copy of the transaction without these might be safer for eth_call.
-            call_tx = transaction.copy()
-            call_tx.pop('nonce', None)
-            call_tx.pop('gas', None)
-            call_tx.pop('maxFeePerGas', None)
-            call_tx.pop('maxPriorityFeePerGas', None)
+            minimal_call_tx = transaction.copy()
+            minimal_call_tx.pop('nonce', None)
+            minimal_call_tx.pop('gas', None)
+            minimal_call_tx.pop('maxFeePerGas', None)
+            minimal_call_tx.pop('maxPriorityFeePerGas', None)
             # Ensure 'from' is present for eth_call
-            if 'from' not in call_tx:
-                 call_tx['from'] = address
+            if 'from' not in minimal_call_tx:
+                 minimal_call_tx['from'] = address
 
-            call_result = w3_instance.eth.call(call_tx, 'latest')
+            if 'value' in transaction: # Include value if it's a payable function
+                minimal_call_tx['value'] = transaction.get('value')
+
+            # Add a high gas limit for the eth_call simulation
+            minimal_call_tx['gas'] = 5_000_000 # A large gas limit for simulation
+
+            # --- DETAILED LOGGING FOR PRE-FLIGHT ETH_CALL (using minimal_call_tx) ---
+            logger.info(f"PRE-FLIGHT ETH_CALL (minimal_call_tx) DETAILS:")
+            logger.info(f"  To: {minimal_call_tx.get('to')}")
+            logger.info(f"  From: {minimal_call_tx.get('from')}")
+            logger.info(f"  Data: {minimal_call_tx.get('data')}")
+            logger.info(f"  Gas: {minimal_call_tx.get('gas')}")
+            logger.info(f"  Value: {minimal_call_tx.get('value', 'Not Present')}")
+            # --- END DETAILED LOGGING ---
+
+            call_result = w3_instance.eth.call(minimal_call_tx, 'latest')
             logger.debug(f"eth_call successful. Result: {call_result.hex() if isinstance(call_result, bytes) else call_result}")
         except Exception as call_e: # Catching a broad exception to see any error from eth_call
             logger.error(f"eth_call FAILED before gas estimation. Error: {call_e}", exc_info=True)
@@ -376,43 +391,46 @@ def _send_signed_transaction(w3_instance, chain_id, transaction, private_key):
             # Log more details from the receipt, ensuring it's not excessively verbose unless debugging
             log_receipt_details(receipt) 
         
-        if receipt.status == 0:
-                logger.error(f"Transaction failed (receipt.status == 0).")
-                # Attempt to get revert reason by replaying the transaction using eth_call at the block before it was mined
-                try:
-                    tx_details = w3_instance.eth.get_transaction(tx_hash)
-                    if tx_details and tx_details.get('blockNumber') is not None:
-                        call_params = {
-                            'to': tx_details.get('to'),
-                            'from': tx_details.get('from'), # Original EOA sender
-                            'value': tx_details.get('value'),
-                            'data': tx_details.get('input'), # 'input' is the data field for historical transactions
-                            # Add gas and gasPrice if they were part of the original tx, or allow eth_call to use defaults
-                            'gas': tx_details.get('gas'),
-                            'gasPrice': tx_details.get('gasPrice')
-                        }
-                        # Remove None values to avoid issues with eth_call
-                        call_params = {k: v for k, v in call_params.items() if v is not None}
-                        
-                        logger.info(f"Attempting to get revert reason by re-calling failed tx (hash: {tx_hash.hex()}) at block {tx_details.blockNumber - 1}")
-                        revert_call_result = w3_instance.eth.call(call_params, tx_details.blockNumber - 1)
-                        logger.error(f"  eth_call result for failed tx: {revert_call_result.hex() if isinstance(revert_call_result, bytes) else revert_call_result}")
-                        # Basic attempt to decode common string revert: Error(string)
-                        if isinstance(revert_call_result, bytes) and revert_call_result.startswith(bytes.fromhex('08c379a0')):
-                            reason = w3_instance.codec.decode(['string'], revert_call_result[4:])[0]
-                            logger.error(f"  Decoded revert reason: {reason}")
+            if receipt.status == 0:
+                    logger.error(f"Transaction failed (receipt.status == 0).")
+                    # Attempt to get revert reason by replaying the transaction using eth_call at the block before it was mined
+                    try:
+                        tx_details = w3_instance.eth.get_transaction(tx_hash)
+                        if tx_details and tx_details.get('blockNumber') is not None:
+                            call_params = {
+                                'to': tx_details.get('to'),
+                                'from': tx_details.get('from'), # Original EOA sender
+                                'value': tx_details.get('value'),
+                                'data': tx_details.get('input'), # 'input' is the data field for historical transactions
+                                # Add gas and gasPrice if they were part of the original tx, or allow eth_call to use defaults
+                                'gas': tx_details.get('gas'),
+                                'gasPrice': tx_details.get('gasPrice')
+                            }
+                            # Remove None values to avoid issues with eth_call
+                            call_params = {k: v for k, v in call_params.items() if v is not None}
+                            
+                            logger.info(f"Attempting to get revert reason by re-calling failed tx (hash: {tx_hash.hex()}) at block {tx_details.blockNumber - 1}")
+                            revert_call_result = w3_instance.eth.call(call_params, tx_details.blockNumber - 1)
+                            logger.error(f"  eth_call result for failed tx: {revert_call_result.hex() if isinstance(revert_call_result, bytes) else revert_call_result}")
+                            # Basic attempt to decode common string revert: Error(string)
+                            if isinstance(revert_call_result, bytes) and revert_call_result.startswith(bytes.fromhex('08c379a0')):
+                                reason = w3_instance.codec.decode(['string'], revert_call_result[4:])[0]
+                                logger.error(f"  Decoded revert reason: {reason}")
+                            else:
+                                logger.error(f"  Could not decode standard string revert reason from result.")
                         else:
-                            logger.error(f"  Could not decode standard string revert reason from result.")
-                    else:
-                        logger.error("Could not get transaction details or blockNumber to attempt fetching revert reason.")
-                except ContractLogicError as cle:
-                     logger.error(f"  Re-call for revert reason failed with ContractLogicError. Message: '{cle.message}'. Data: {cle.data if hasattr(cle, 'data') else 'N/A'}")
-                except Exception as e_call_revert:
-                    logger.error(f"  Could not fetch revert reason via eth_call: {e_call_revert}", exc_info=True)
-                return {"tx_hash": tx_hash.hex(), "receipt": receipt, "error": "Transaction reverted with status 0", "status": 0}
+                            logger.error("Could not get transaction details or blockNumber to attempt fetching revert reason.")
+                    except ContractLogicError as cle:
+                         logger.error(f"  Re-call for revert reason failed with ContractLogicError. Message: '{cle.message}'. Data: {cle.data if hasattr(cle, 'data') else 'N/A'}")
+                    except Exception as e_call_revert:
+                        logger.error(f"  Could not fetch revert reason via eth_call: {e_call_revert}", exc_info=True)
+                    return {"tx_hash": tx_hash.hex(), "receipt": receipt, "error": "Transaction reverted with status 0", "status": 0}
 
             logger.info(f"Transaction confirmed. Block: {receipt.blockNumber}, Gas used: {receipt.gasUsed}")
             return {"tx_hash": tx_hash.hex(), "receipt": receipt, "status": 1}
+        except w3_instance.exceptions.TimeExhausted:
+            logger.error(f"Timeout waiting for transaction receipt for tx {tx_hash.hex()}", exc_info=True)
+            return {"tx_hash": tx_hash.hex(), "receipt": None, "error": "Timeout waiting for receipt", "status": -2} # Custom status for timeout
     except TransactionNotFound:
         logger.error(f"Transaction {tx_hash.hex()} not found after timeout.")
         return None
@@ -551,8 +569,93 @@ def update_reference_model_from_mtx(
         receipt = _send_signed_transaction(w3_conn, CHAIN_ID, transaction, signer_private_key)
         return receipt
 
+    except ContractLogicError as e:
+        logger.error(f"ContractLogicError during updateReferenceModelFromMtx (MTX ID: {mtx_id}): {e}")
+        # Try to get revert reason if available in data
+        if hasattr(e, 'args') and e.args:
+            error_details = e.args[0]
+            logger.error(f"  Error args: {error_details}")
+            if isinstance(error_details, dict):
+                message = error_details.get('message', 'No message in dict')
+                data = error_details.get('data', 'No data in dict')
+                logger.error(f"  ContractLogicError Message: {message}")
+                logger.error(f"  ContractLogicError Data: {data}")
+                if isinstance(data, str) and data.startswith('0x') and len(data) > 2:
+                    try:
+                        # Attempt to decode common revert string selector: Error(string)
+                        if data.startswith('0x08c379a0'): # selector for Error(string)
+                            reason = w3_conn.codec.decode(['string'], bytes.fromhex(data[10:]))[0] # remove selector and offset
+                            logger.error(f"  Decoded revert reason: {reason}")
+                        else:
+                            logger.warning(f"  Data does not match known Error(string) selector. Raw data: {data}")
+                    except Exception as decode_err:
+                        logger.error(f"  Could not decode revert reason from data '{data}': {decode_err}")
+            elif isinstance(error_details, str):
+                 logger.error(f"  Raw revert message string: {error_details}")
+        return None
     except Exception as e:
-        logger.error(f"Error building or sending updateReferenceModelFromMtx transaction: {e}", exc_info=True)
+        logger.error(f"Generic error building or sending updateReferenceModelFromMtx transaction (MTX ID: {mtx_id}): {e}", exc_info=True)
+        return None
+
+def update_mtx_status(
+    mtx_id: int,
+    status_code: int, # Use integer codes from MTX_STATUS_MAP
+    signer_private_key: str
+) -> dict | None:
+    """Updates the status of an MTX in the MTXMempool."""
+    w3_conn = get_w3()
+    mempool = get_mempool() # Corrected from mempool_contract_instance to mempool
+    if not w3_conn or not mempool:
+        logger.error("Cannot update MTX status: Interface not initialized.")
+        return None
+    if not signer_private_key:
+        logger.error("Cannot update MTX status: Signer private key required.")
+        return None
+
+    if status_code not in MTX_STATUS_MAP:
+        logger.error(f"Invalid status_code {status_code} for update_mtx_status. Valid codes are {list(MTX_STATUS_MAP.keys())}.")
+        return None
+    
+    status_str = MTX_STATUS_MAP[status_code]
+    logger.info(f"Building updateMtxStatus transaction for MTX ID: {mtx_id} to status: {status_str} ({status_code})")
+
+    try:
+        transaction = mempool.functions.updateMtxStatus(
+            mtx_id,
+            status_code
+        ).build_transaction({
+            # Gas/nonce params handled by _send_signed_transaction helper
+        })
+        
+        send_result = _send_signed_transaction(w3_conn, CHAIN_ID, transaction, signer_private_key)
+        
+        if send_result and send_result.get("status") == 1:
+            actual_receipt = send_result.get("receipt")
+            tx_hash_hex = send_result.get("tx_hash")
+            logger.info(f"MTX status update transaction successful for MTX ID {mtx_id}. TxHash: {tx_hash_hex}. Parsing MtxStatusUpdated event...")
+            try:
+                events = mempool.events.MtxStatusUpdated().process_receipt(actual_receipt, errors=EventLogErrorFlags.Warn)
+                if events:
+                    event_args = events[0]['args']
+                    parsed_mtx_id = event_args['mtxId']
+                    new_status_from_event = event_args['newStatus']
+                    logger.info(f"Successfully parsed MtxStatusUpdated event. MTX ID: {parsed_mtx_id}, New Status: {MTX_STATUS_MAP.get(new_status_from_event, 'Unknown')} ({new_status_from_event})")
+                    return {"tx_hash": tx_hash_hex, "receipt": actual_receipt, "parsed_mtx_id": parsed_mtx_id, "new_status": new_status_from_event, "status": 1}
+                else:
+                    logger.warning(f"MtxStatusUpdated event not found in transaction receipt logs for MTX ID {mtx_id}, though transaction was successful.")
+                    return {"tx_hash": tx_hash_hex, "receipt": actual_receipt, "parsed_mtx_id": None, "new_status": None, "status": 1}
+            except Exception as e_event_parsing:
+                logger.error(f"Error parsing MtxStatusUpdated event for MTX ID {mtx_id}: {e_event_parsing}", exc_info=True)
+                return {"tx_hash": tx_hash_hex, "receipt": actual_receipt, "parsed_mtx_id": None, "new_status": None, "status": 1}
+        elif send_result: # Transaction failed but we got a result dictionary (e.g. status 0)
+            logger.error(f"MTX status update transaction failed for MTX ID {mtx_id}. Result: {send_result}")
+            return send_result # Forward the error result
+        else: # _send_signed_transaction returned None (e.g. timeout before receipt or other critical failure)
+            logger.error(f"MTX status update failed for MTX ID {mtx_id}: No result from _send_signed_transaction.")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error building or sending updateMtxStatus transaction for MTX ID {mtx_id}: {e}", exc_info=True)
         return None
 
 def log_receipt_details(receipt):

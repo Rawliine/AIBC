@@ -241,19 +241,19 @@ def worker_train_loop(config):
             reference_model_state = None
             reference_model_id = None # Ensure it's cleared if not loadable
         else:
-        reference_model_state = load_model_state_from_ipfs(reference_model_id, "reference_model")
-        # --- Added Failure Check --- 
-        if reference_model_state is None:
-            worker_logger.error(f"CRITICAL: Failed to load reference model {reference_model_id} from IPFS. Continuing without reference weights.")
-            # In a stricter setup, this might warrant raising an error or stopping the worker.
-            # For now, we just log and proceed without transfer/comparison.
-            reference_model_id = None # Clear reference ID to prevent further use attempts
-        
-        elif transfer_reference_weights:
-            worker_logger.info("Transferring weights from reference model.")
-            transfer_weights(model, reference_model_state)
-        else:
-            worker_logger.info("Reference model loaded, but weight transfer is disabled.")
+            reference_model_state = load_model_state_from_ipfs(reference_model_id, "reference_model")
+            # --- Added Failure Check --- 
+            if reference_model_state is None:
+                worker_logger.error(f"CRITICAL: Failed to load reference model {reference_model_id} from IPFS. Continuing without reference weights.")
+                # In a stricter setup, this might warrant raising an error or stopping the worker.
+                # For now, we just log and proceed without transfer/comparison.
+                reference_model_id = None # Clear reference ID to prevent further use attempts
+            
+            elif transfer_reference_weights:
+                worker_logger.info("Transferring weights from reference model.")
+                transfer_weights(model, reference_model_state)
+            else:
+                worker_logger.info("Reference model loaded, but weight transfer is disabled.")
 
     # --- Deterministic Weight Initialization (if reference loading failed or wasn't used) ---
     if not reference_model_state:
@@ -565,8 +565,8 @@ def worker_train_loop(config):
                             try:
                                 final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_block_{current_dpodl_state['steps_at_checkpoint']}"))
                                 checkpoint_data_cid_for_tx = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_block_{current_dpodl_state['steps_at_checkpoint']}"))
-                        except Exception as ipfs_err:
-                             worker_logger.error(f"Error saving data to IPFS before block submission: {ipfs_err}", exc_info=True)
+                            except Exception as ipfs_err:
+                                 worker_logger.error(f"Error saving data to IPFS before block submission: {ipfs_err}", exc_info=True)
 
                         if final_model_cid_for_tx and checkpoint_data_cid_for_tx:
                             worker_logger.info(f"IPFS Save Complete: Model CID: {final_model_cid_for_tx}, Checkpoint Data CID: {checkpoint_data_cid_for_tx}")
@@ -613,7 +613,7 @@ def worker_train_loop(config):
                             try:
                                 # Save the model state to IPFS and get its CID
                                 final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
-                        except Exception as ipfs_err:
+                            except Exception as ipfs_err:
                                  worker_logger.error(f"Error saving model state to IPFS before MTX submission: {ipfs_err}", exc_info=True)
                                  # If model save fails, we can't proceed with this MTX submission.
                                  final_model_cid_for_tx = None # Ensure it's None
@@ -661,25 +661,22 @@ def worker_train_loop(config):
                                     steps=int(current_dpodl_state['steps_at_checkpoint']),
                                     reference_cid=current_dpodl_state['reference_model_id'] if current_dpodl_state['reference_model_id'] else "",
                                         signer_private_key=worker_private_key
-                        )
+                                )
                                 submission_receipt = receipt # Assign the result to submission_receipt
-                                    if receipt and isinstance(receipt, dict) and 'receipt' in receipt and receipt['receipt']:
-                                        # Access the actual receipt object from the dictionary
-                                        actual_tx_receipt = receipt['receipt']
-                                        worker_logger.info(f"MTX submitted successfully! Tx Hash: {actual_tx_receipt.transactionHash.hex()}")
-                                        tx_hash_for_record = actual_tx_receipt.transactionHash.hex() # Capture for submission record
-                                    elif receipt: # Fallback for older direct receipt return, or if structure is different unexpectedly
-                                        worker_logger.warning(f"MTX submission result type unexpected or actual receipt missing. Full result: {receipt}")
-                                        # Attempt to find transactionHash if possible, otherwise log an error
-                                        if hasattr(receipt, 'transactionHash'): 
-                                             worker_logger.info(f"MTX submitted (fallback)! Tx Hash: {receipt.transactionHash.hex()}")
-                                             tx_hash_for_record = receipt.transactionHash.hex()
-                                        else: 
-                                             worker_logger.error("CRITICAL: MTX submission failed or receipt structure unknown (no transactionHash).")
-                                        tx_hash_for_record = None # Ensure it's None if not found
-                                else:
-                                    worker_logger.error("CRITICAL: MTX submission failed (receipt is None).")
-                                        tx_hash_for_record = None # Ensure it's None
+                                if receipt and isinstance(receipt, dict) and 'receipt' in receipt and receipt['receipt']:
+                                    # Access the actual receipt object from the dictionary
+                                    actual_tx_receipt = receipt['receipt']
+                                    worker_logger.info(f"MTX submitted successfully! Tx Hash: {actual_tx_receipt.transactionHash.hex()}")
+                                    tx_hash_for_record = actual_tx_receipt.transactionHash.hex() # Capture for submission record
+                                elif receipt: # Fallback for older direct receipt return, or if structure is different unexpectedly
+                                    worker_logger.warning(f"MTX submission result type unexpected or actual receipt missing. Full result: {receipt}")
+                                    # Attempt to find transactionHash if possible, otherwise log an error
+                                    if hasattr(receipt, 'transactionHash'): 
+                                         worker_logger.info(f"MTX submitted (fallback)! Tx Hash: {receipt.transactionHash.hex()}")
+                                         tx_hash_for_record = receipt.transactionHash.hex()
+                                    else: 
+                                         worker_logger.error("CRITICAL: MTX submission failed or receipt structure unknown (no transactionHash).")
+                                    tx_hash_for_record = None # Ensure it's None if not found
                             except Exception as e:
                                 worker_logger.error(f"CRITICAL: Error submitting MTX to blockchain: {e}", exc_info=True)
                                 # TODO: Implement retry or failure handling

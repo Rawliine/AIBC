@@ -4,43 +4,16 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol"; // Interface for interacting with the token
 import "./DPoDLToken.sol"; // Import the specific token contract type
+import "./MTXMempool.sol"; // ADDED: Import the MTXMempool contract to access its types
 
 // Interface for MTXMempool
 interface IMTXMempool {
-    // Define the Status enum directly in the interface
-    enum Status {
-        Pending,
-        SelectedForProcessing,
-        Processed,
-        Rejected
-    }
+    // Status enum and ModelTransaction struct are now defined in MTXMempool.sol
+    // and will be accessed via MTXMempool.Status and MTXMempool.ModelTransaction
 
-    function updateMtxStatus(uint256 mtxId, uint8 newStatus) external; // newStatus is uint8 due to enum
-    // We need to get the submitter of an MTX to reward them.
-    // Assuming MTXMempool.sol has a getMtxDetails function that returns at least the submitter.
-    // We only need the submitter for now for reward distribution.
-    // struct ModelTransaction { // From MTXMempool.sol (for reference of fields)
-    //     uint256 mtxId;
-    //     string ipfsCID; // This is the DPoDL checkpoint CID for the MTX
-    //     uint256 accuracyBPS; // Self-reported, verified off-chain
-    //     uint256 steps;
-    //     string referenceModelCID; // The reference model state CID it was based on
-    //     address submitter;
-    //     uint256 timestamp;
-    //     Status status;
-    //     bool isValid; // Indicates if the MTX is structurally valid by contract
-    // }
-    function getMtxDetails(uint256 mtxId) external view returns (
-        uint256, // mtxId
-        string memory, // ipfsCID
-        uint256, // accuracyBPS
-        uint256, // steps
-        string memory, // referenceModelCID
-        address, // submitter
-        uint256, // timestamp
-        uint8,   // status (as uint8)
-        bool     // isValid
-    );
+    function updateMtxStatus(uint256 mtxId, MTXMempool.Status newStatus) external; // Use MTXMempool.Status
+    
+    function getMtxDetails(uint256 mtxId) external view returns (MTXMempool.ModelTransaction memory);
 }
 
 /**
@@ -98,6 +71,10 @@ contract ModelRegistry is Ownable {
     string public currentModelStateCID;          // CID of the model state (weights) to train from
     string public currentDpodlCheckpointCID;    // CID of the D-PoDL checkpoint data for the currentModelStateCID
 
+    // Additional state for tracking MTX processing
+    uint256 public lastGlobalModelUpdateTime; // ADDED: Timestamp of the last global model update via MTX
+    uint256 public lastProcessedMtxId;      // ADDED: ID of the last MTX processed
+
     // Genesis Block Info (optional, can be set in constructor or first submission)
     // string public genesisCID = ""; // REMOVED: Placeholder for potential genesis model. Replaced by currentModelStateCID initialization.
 
@@ -146,6 +123,8 @@ contract ModelRegistry is Ownable {
 
     // New Debug Event
     event DebugStep(uint256 indexed step);
+
+    event UpdateReferenceModelFromMtxCalled(uint256 mtxId, string modelCID, string dpodlCID, address caller);
 
     // --- Errors ---
     error InvalidReferenceModel(string submittedCID, string expectedCID);
@@ -477,106 +456,47 @@ contract ModelRegistry is Ownable {
         string memory _newModelStateCID,
         string memory _newDpodlCheckpointCID,
         uint256 _mtxId
-    ) external onlyOwner { 
-        emit DebugStep(1); 
-
-        require(address(mtxMempoolContract) != address(0), "MR: MTXMempool contract address not set");
-        emit DebugStep(2); 
-        require(_mtxId > 0, "MR: MTX ID must be valid (not zero)");
-        emit DebugStep(3);
-        require(bytes(_newModelStateCID).length > 0, "MR: New model state CID cannot be empty");
-        emit DebugStep(4);
-        require(bytes(_newDpodlCheckpointCID).length > 0, "MR: New DPoDL checkpoint CID cannot be empty");
-        emit DebugStep(5);
-
-        // Update global reference CIDs
-        currentModelStateCID = _newModelStateCID; 
-        emit DebugStep(6);
-        currentDpodlCheckpointCID = _newDpodlCheckpointCID; 
-        emit DebugStep(7);
-
-        address mtxSubmitter;
-        // Other variables from getMtxDetails - declare them to avoid stack issues if not used later
-        uint256 mtxIdReturned;
-        string memory ipfsCIDReturned;
-        uint256 accuracyBPSReturned;
-        uint256 stepsReturned;
-        string memory referenceModelCIDReturned;
-        uint256 timestampReturned;
-        uint8 statusReturned; // Changed from IMTXMempool.Status
-        bool isValidReturned;
-
-        try mtxMempoolContract.getMtxDetails(_mtxId) returns (uint256, string memory, uint256, uint256, string memory, address, uint256, uint8, bool) {
-            // emit DebugStep(100); // Inside try for getMtxDetails
-            (
-                mtxIdReturned,
-                ipfsCIDReturned,
-                accuracyBPSReturned,
-                stepsReturned,
-                referenceModelCIDReturned,
-                mtxSubmitter,
-                timestampReturned,
-                statusReturned,
-                isValidReturned
-            ) = mtxMempoolContract.getMtxDetails(_mtxId);
-            // emit DebugStep(101); // After successful getMtxDetails
-        } catch (bytes memory reason) {
-            // emit DebugStep(199); // Inside catch for getMtxDetails
-            if (reason.length == 0) {
-                revert("MR: getMtxDetails failed - no reason from mempool");
-            }
-            revert(string(abi.encodePacked("MR: getMtxDetails call failed: ", reason)));
-        }
+    ) external onlyOwner returns (bool) {
+        emit UpdateReferenceModelFromMtxCalled(_mtxId, _newModelStateCID, _newDpodlCheckpointCID, msg.sender);
         
-        // emit DebugStep(8);
-        require(mtxSubmitter != address(0), "MR: MTX submitter address is zero after getMtxDetails");
-        // emit DebugStep(9);
-        require(mtxRewardAmount > 0, "MR: MTX reward amount is zero, cannot mint zero reward");
-        // emit DebugStep(10);
+        require(address(mtxMempoolContract) != address(0), "MR_ERR: Mempool contract address is zero");
+        require(address(dpdlToken) != address(0), "MR_ERR: Token contract address is zero");
 
-        if (address(dpdlToken) != address(0) && mtxRewardAmount > 0 && mtxSubmitter != address(0)) {
-            // emit DebugStep(200); // Inside if for token mint
-            try DPoDLToken(address(dpdlToken)).mint(mtxSubmitter, mtxRewardAmount) {
-                // emit DebugStep(201); // Inside try for mint
-                // Minting successful, an event is emitted by the token itself if it has one.
-                // We emit our specific reward event after this.
-            } catch (bytes memory reason) {
-                // emit DebugStep(299); // Inside catch for mint
-                if (reason.length == 0) {
-                    revert("MR: DPoDLToken.mint failed - no reason from token");
-                }
-                revert(string(abi.encodePacked("MR: Low-level error calling token mint: ", reason)));
-            }
-            // emit DebugStep(11); // After try-catch for mint
-            // Emit event for successful reward distribution
-            emit RewardDistributedForMtx(_mtxId, mtxSubmitter, mtxRewardAmount);
-        } else {
-            // emit DebugStep(12); // If token minting is skipped
+        // Correctly get the struct and then access its members
+        MTXMempool.ModelTransaction memory mtx = mtxMempoolContract.getMtxDetails(_mtxId);
+
+        require(mtx.mtxId == _mtxId, "MR_ERR: MTX ID mismatch or MTX not found");
+        require(mtx.status == MTXMempool.Status.SelectedForProcessing, "MR_ERR: MTX not SelectedForProcessing"); // Use MTXMempool.Status
+        require(bytes(mtx.ipfsCID).length > 0, "MR_ERR: MTX DPoDL Checkpoint CID is empty");
+        require(bytes(_newModelStateCID).length > 0, "MR_ERR: New Model State CID is empty");
+        require(keccak256(bytes(mtx.ipfsCID)) == keccak256(bytes(_newDpodlCheckpointCID)), "MR_ERR: DPoDL CIDs mismatch");
+
+        currentModelStateCID = _newModelStateCID;
+        currentDpodlCheckpointCID = _newDpodlCheckpointCID;
+        lastGlobalModelUpdateTime = block.timestamp; // CORRECTED: Assignment to declared variable
+        lastProcessedMtxId = _mtxId;                 // CORRECTED: Assignment to declared variable
+
+        uint256 rewardAmount = mtxRewardAmount; // CORRECTED: Use state variable mtxRewardAmount
+        if (rewardAmount > 0) {
+            // CORRECTED: Cast to DPoDLToken (imported type) instead of undefined IDPoDLToken
+            DPoDLToken(address(dpdlToken)).mint(mtx.submitter, rewardAmount);
+            // The line above will revert if minting fails (e.g., due to lack of MINTER_ROLE)
+            
+            // CORRECTED: Use existing RewardDistributedForMtx event
+            emit RewardDistributedForMtx(_mtxId, mtx.submitter, rewardAmount); 
         }
-        
-        // emit DebugStep(13);
-        // Update MTX status in MTXMempool to Processed
-        try mtxMempoolContract.updateMtxStatus(_mtxId, uint8(IMTXMempool.Status.Processed)) { // Use the interface's enum
-            // emit DebugStep(300); // Inside try for updateMtxStatus
-            // Status updated successfully
-        } catch (bytes memory reason) {
-            // emit DebugStep(399); // Inside catch for updateMtxStatus
-            if (reason.length == 0) {
-                revert("MR: updateMtxStatus failed - no reason from mempool");
-            }
-            revert(string(abi.encodePacked("MR: updateMtxStatus call failed: ", reason)));
-        }
-        
-        // emit DebugStep(14);
-        // Emit event for global model update
+
+        mtxMempoolContract.updateMtxStatus(_mtxId, MTXMempool.Status.Processed); // Use MTXMempool.Status
+        // CORRECTED: Use existing GlobalReferenceModelUpdated event with appropriate parameters for MTX update
         emit GlobalReferenceModelUpdated(
-            currentModelStateCID,
-            currentDpodlCheckpointCID,
-            msg.sender, // The caller of this function (owner/operator)
-            _mtxId,     // For MTX updates, use MTX ID as the identifier
-            false       // isBlockUpdate = false
+            _newModelStateCID, 
+            _newDpodlCheckpointCID, 
+            msg.sender, // The operator (owner) is the updater
+            _mtxId,     // ID is the mtxId
+            false       // isBlockUpdate = false for MTX
         );
-        // emit DebugStep(15); // End of function
+        
+        return true;
     }
 
     // --- View Functions ---
