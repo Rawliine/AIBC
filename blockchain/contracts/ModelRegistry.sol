@@ -5,6 +5,44 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol"; // Interface for interacting with the token
 import "./DPoDLToken.sol"; // Import the specific token contract type
 
+// Interface for MTXMempool
+interface IMTXMempool {
+    // Define the Status enum directly in the interface
+    enum Status {
+        Pending,
+        SelectedForProcessing,
+        Processed,
+        Rejected
+    }
+
+    function updateMtxStatus(uint256 mtxId, uint8 newStatus) external; // newStatus is uint8 due to enum
+    // We need to get the submitter of an MTX to reward them.
+    // Assuming MTXMempool.sol has a getMtxDetails function that returns at least the submitter.
+    // We only need the submitter for now for reward distribution.
+    // struct ModelTransaction { // From MTXMempool.sol (for reference of fields)
+    //     uint256 mtxId;
+    //     string ipfsCID; // This is the DPoDL checkpoint CID for the MTX
+    //     uint256 accuracyBPS; // Self-reported, verified off-chain
+    //     uint256 steps;
+    //     string referenceModelCID; // The reference model state CID it was based on
+    //     address submitter;
+    //     uint256 timestamp;
+    //     Status status;
+    //     bool isValid; // Indicates if the MTX is structurally valid by contract
+    // }
+    function getMtxDetails(uint256 mtxId) external view returns (
+        uint256, // mtxId
+        string memory, // ipfsCID
+        uint256, // accuracyBPS
+        uint256, // steps
+        string memory, // referenceModelCID
+        address, // submitter
+        uint256, // timestamp
+        uint8,   // status (as uint8)
+        bool     // isValid
+    );
+}
+
 /**
  * @title ModelRegistry
  * @dev Stores the canonical chain of validated D-PoDL models (blocks).
@@ -20,7 +58,8 @@ contract ModelRegistry is Ownable {
      */
     struct ModelBlock {
         uint256 blockHeight;          // Sequential ID of the block
-        string ipfsCID;               // IPFS CID of the model checkpoint file
+        string modelStateCID;         // IPFS CID of the model's actual state_dict
+        string dpodlCheckpointCID;    // IPFS CID of the D-PoDL state/proofs/metadata file for this block
         uint256 accuracyBPS;          // Accuracy in Basis Points (e.g., 9500 for 95.00%)
         uint256 steps;                // Training steps performed for this model
         uint256 postHash;             // The hash value that met the T1 threshold
@@ -34,7 +73,8 @@ contract ModelRegistry is Ownable {
     // D-PoDL Parameters (public for easy reading, modifiable by owner)
     uint256 public t1Threshold;         // Target hash threshold (lower is harder)
     uint256 public tAccuracyThresholdBPS; // Target accuracy threshold in Basis Points
-    uint256 public blockRewardAmount;   // Amount of DPDL tokens rewarded per block
+    uint256 public blockRewardAmount;   // Amount of DPDL tokens rewarded per block for new blocks
+    uint256 public mtxRewardAmount;     // Amount of DPDL tokens rewarded for a processed MTX
     uint256 public minTrainingSteps;    // Minimum training steps required
     uint256 public maxTrainingSteps;    // Maximum training steps allowed to prevent overtraining
     uint256 public referenceRewardShareBPS; // Share of reward for reference model proposer (0-10000)
@@ -46,13 +86,20 @@ contract ModelRegistry is Ownable {
     // Token Contract
     IERC20 public dpdlToken;             // Address of the DPoDLToken contract
 
+    // MTXMempool Contract Interface
+    IMTXMempool public mtxMempoolContract;
+
     // Model Chain Storage
     mapping(uint256 => ModelBlock) public modelBlocks; // blockHeight => ModelBlock data
     uint256 public currentBlockHeight;                 // Height of the latest accepted block
-    mapping(string => uint256) public cidToBlockHeight; // ipfsCID => blockHeight (for quick lookup)
+    mapping(string => uint256) public dpodlCheckpointCIDToBlockHeight; // NEW: dpodlCheckpointCID => blockHeight
+
+    // Current Global Reference Model CIDs (updated by new blocks or selected MTXs)
+    string public currentModelStateCID;          // CID of the model state (weights) to train from
+    string public currentDpodlCheckpointCID;    // CID of the D-PoDL checkpoint data for the currentModelStateCID
 
     // Genesis Block Info (optional, can be set in constructor or first submission)
-    string public genesisCID = ""; // Placeholder for potential genesis model
+    // string public genesisCID = ""; // REMOVED: Placeholder for potential genesis model. Replaced by currentModelStateCID initialization.
 
     // --- Events ---
 
@@ -61,7 +108,8 @@ contract ModelRegistry is Ownable {
      */
     event ModelAccepted(
         uint256 indexed blockHeight,
-        string ipfsCID,
+        string modelStateCID,         // NEW
+        string dpodlCheckpointCID,    // NEW
         uint256 accuracyBPS,
         uint256 postHash,
         string referenceModelCID,
@@ -77,7 +125,27 @@ contract ModelRegistry is Ownable {
     /**
      * @dev Emitted when a reward minting operation fails.
      */
-    event RewardMintFailed(address indexed proposer, uint256 amount);
+    event RewardMintFailed(address indexed to, uint256 amount); // For block submission rewards
+
+    /**
+     * @dev Emitted when the global reference model (state and DPoDL checkpoint) is updated,
+     *      either by a new block or by processing an MTX.
+     */
+    event GlobalReferenceModelUpdated(
+        string modelStateCID,
+        string dpodlCheckpointCID,
+        address indexed updater,
+        uint256 indexed id, // mtxId if from MTX (isBlockUpdate=false), blockHeight if from Block (isBlockUpdate=true)
+        bool isBlockUpdate // True if update was from a new block, false if from an MTX
+    );
+
+    /**
+     * @dev Emitted when a reward is distributed for processing an MTX.
+     */
+    event RewardDistributedForMtx(uint256 indexed mtxId, address indexed submitter, uint256 rewardAmount);
+
+    // New Debug Event
+    event DebugStep(uint256 indexed step);
 
     // --- Errors ---
     error InvalidReferenceModel(string submittedCID, string expectedCID);
@@ -104,6 +172,9 @@ contract ModelRegistry is Ownable {
      * @param _initialReferenceRewardShareBPS The initial reference reward share in Basis Points (0-10000).
      * @param _tokenAddress The address of the deployed DPoDLToken contract.
      * @param _initialOwner The address designated as the contract owner.
+     * @param _initialGenesisModelStateCID The IPFS CID of the initial (genesis) model state.
+     * @param _initialGenesisDpodlCheckpointCID The IPFS CID of the DPoDL checkpoint for the genesis model (can be empty string if not applicable).
+     * @param _initialMtxRewardAmount The initial DPDL token reward for a processed MTX.
      */
     constructor(
         uint256 _initialT1Threshold,
@@ -115,7 +186,10 @@ contract ModelRegistry is Ownable {
         uint256 _initialMinStepImprovement,
         uint256 _initialReferenceRewardShareBPS,
         address _tokenAddress,
-        address _initialOwner // Pass initial owner explicitly
+        address _initialOwner, // Pass initial owner explicitly
+        string memory _initialGenesisModelStateCID,
+        string memory _initialGenesisDpodlCheckpointCID,
+        uint256 _initialMtxRewardAmount // New constructor argument
     ) Ownable(_initialOwner) {
         if (_tokenAddress == address(0)) revert ZeroAddress();
         if (_initialOwner == address(0)) revert ZeroAddress(); // Ensure owner is not zero address
@@ -136,6 +210,13 @@ contract ModelRegistry is Ownable {
         dpdlToken = IERC20(_tokenAddress);
         currentBlockHeight = 0; // Initialize block height
 
+        // Initialize current global model CIDs from genesis values
+        // Basic validation for genesis CIDs (must not be empty for model state)
+        if (bytes(_initialGenesisModelStateCID).length == 0) revert("Genesis model state CID cannot be empty");
+        currentModelStateCID = _initialGenesisModelStateCID;
+        currentDpodlCheckpointCID = _initialGenesisDpodlCheckpointCID; // Can be empty if no specific DPoDL checkpoint for genesis
+        mtxRewardAmount = _initialMtxRewardAmount; // Initialize MTX reward amount
+
         emit ParameterUpdated("t1Threshold", _initialT1Threshold);
         emit ParameterUpdated("tAccuracyThresholdBPS", _initialTAccuracyThresholdBPS);
         emit ParameterUpdated("blockRewardAmount", _initialBlockRewardAmount);
@@ -145,6 +226,16 @@ contract ModelRegistry is Ownable {
         emit ParameterUpdated("minStepImprovement", _initialMinStepImprovement);
         emit ParameterUpdated("referenceRewardShareBPS", _initialReferenceRewardShareBPS);
         emit ParameterUpdated("dpdlToken", uint256(uint160(_tokenAddress))); // Emit address as uint
+        emit ParameterUpdated("mtxRewardAmount", _initialMtxRewardAmount); // Emit new param
+
+        // Emit the initial state of the global reference model
+        emit GlobalReferenceModelUpdated(
+            currentModelStateCID,
+            currentDpodlCheckpointCID,
+            address(this), // Updater is the contract itself during deployment
+            0,             // ID is 0 for genesis/initialization (block height 0)
+            true           // isBlockUpdate is true, as it establishes the first baseline
+        );
     }
 
     // --- Core Functions ---
@@ -153,28 +244,49 @@ contract ModelRegistry is Ownable {
      * @dev Verifies that a model has made sufficient improvement over its reference model.
      * @param _accuracyBPS The accuracy of the submitted model.
      * @param _steps The training steps of the submitted model.
-     * @param _referenceModelCID The CID of the reference model.
+     * @param _referenceDpodlCheckpointCID The DPoDL Checkpoint CID of the reference model this submission was based on.
      * @return A boolean indicating if the improvement is sufficient.
      */
     function verifyModelImprovement(
         uint256 _accuracyBPS,
         uint256 _steps,
-        string memory _referenceModelCID
+        string memory _referenceDpodlCheckpointCID
     ) public view returns (bool) {
-        // Skip improvement check for genesis submissions
-        if (bytes(_referenceModelCID).length == 0 || 
-            keccak256(abi.encodePacked(_referenceModelCID)) == keccak256(abi.encodePacked(genesisCID))) {
-            return true;
+        // If there's no reference DPoDL checkpoint CID provided, it implies a submission against the absolute genesis
+        // or a state where no DPoDL checkpoint is yet established as the reference.
+        if (bytes(_referenceDpodlCheckpointCID).length == 0) {
+            // This case should ideally only be true if currentDpodlCheckpointCID is also empty (true genesis)
+            // or if the system allows submissions without explicit reference under certain conditions.
+            // For simplicity, if no reference is given, and we are at block 0, assume it's a genesis-like submission.
+            if (currentBlockHeight == 0) return true;
+            // Otherwise, a reference is generally expected if blocks exist.
+            // Depending on policy, could revert here or return false.
+            // For now, let allow if at block 0, otherwise false if empty ref passed beyond genesis. 
+            return false; 
         }
 
-        // Get reference model block height
-        uint256 referenceBlockHeight = cidToBlockHeight[_referenceModelCID];
+        // If currentBlockHeight is 0, it means we are checking against the initial DPoDL checkpoint set by constructor.
+        // The _referenceDpodlCheckpointCID must match this initial currentDpodlCheckpointCID.
+        if (currentBlockHeight == 0) {
+            if (keccak256(abi.encodePacked(_referenceDpodlCheckpointCID)) == keccak256(abi.encodePacked(currentDpodlCheckpointCID))) {
+                return true; // Improvement check bypassed for first block against constructor-set DPoDL checkpoint
+            }
+            // If it doesn't match, it's an invalid reference for the very first block submission.
+            revert("Invalid reference DPoDL checkpoint for initial block");
+        }
+
+        // Get reference model block height using the DPoDL checkpoint CID
+        uint256 referenceBlockHeight = dpodlCheckpointCIDToBlockHeight[_referenceDpodlCheckpointCID];
         if (referenceBlockHeight == 0) {
-            // Reference model not found in registry
-            return false;
+            // This means the provided _referenceDpodlCheckpointCID is not a known block's DPoDL checkpoint.
+            // This could happen if it refers to an MTX-updated currentDpodlCheckpointCID that hasn't been consolidated into a block yet,
+            // OR if it's simply an invalid/unknown CID.
+            // For verifyModelImprovement (called by submitBlock), the reference *must* be an existing block.
+            // If an MTX updated currentDpodlCheckpointCID, a new block referencing it would need that MTX's stats.
+            // This simplification assumes submitBlock always references a prior *block's* DPoDL checkpoint.
+            revert("Reference DPoDL checkpoint CID not found in block history");
         }
 
-        // Get reference model details
         ModelBlock memory referenceBlock = modelBlocks[referenceBlockHeight];
         
         // Check for accuracy improvement
@@ -194,26 +306,37 @@ contract ModelRegistry is Ownable {
      * @dev Allows a proposer to submit a potential new model block.
      *      Validates the submission against D-PoDL consensus rules.
      *      If valid, adds the block to the registry and rewards the proposer.
-     * @param _ipfsCID The IPFS CID of the proposed model checkpoint.
+     * @param _newModelStateCID The IPFS CID of the model's actual state_dict.
+     * @param _newDpodlCheckpointCID The IPFS CID of the D-PoDL state/proofs/metadata file for this block.
      * @param _accuracyBPS The accuracy achieved by the model (in Basis Points, 1-10000).
      * @param _steps The number of training steps performed.
      * @param _postHash The Post-Hash value calculated by the worker.
-     * @param _referenceModelCID The CID of the model this submission was based on.
+     * @param _referenceDpodlCheckpointCID The DPoDL Checkpoint CID of the model this block was based on.
      */
     function submitBlock(
-        string memory _ipfsCID,
+        string memory _newModelStateCID,       // NEW: CID of the actual model state dict
+        string memory _newDpodlCheckpointCID, // NEW: CID of the D-PoDL metadata/proofs checkpoint for this block
         uint256 _accuracyBPS,
         uint256 _steps,
         uint256 _postHash,
-        string memory _referenceModelCID
+        string memory _referenceDpodlCheckpointCID // NEW: The DPoDL Checkpoint CID of the model this block was based on
     ) public {
         // --- Validation Checks ---
 
-        // 1. Check if based on the correct reference model (current chain head)
-        string memory expectedReferenceCID = getCurrentReferenceModel();
-        // Use keccak256 for string comparison as Solidity lacks direct `==` for strings in storage/memory
-        if (keccak256(abi.encodePacked(_referenceModelCID)) != keccak256(abi.encodePacked(expectedReferenceCID))) {
-            revert InvalidReferenceModel(_referenceModelCID, expectedReferenceCID);
+        // 1. Check if based on the correct reference DPoDL checkpoint (from current global state)
+        string memory expectedReferenceDpodlCheckpointCID = getCurrentReferenceDpodlCheckpointCID();
+        
+        // Handle case where initial model might not have a DPoDL checkpoint CID (empty string)
+        // A submission against such a genesis would pass an empty _referenceDpodlCheckpointCID.
+        if (bytes(expectedReferenceDpodlCheckpointCID).length == 0) {
+            if (bytes(_referenceDpodlCheckpointCID).length != 0) {
+                revert InvalidReferenceModel(_referenceDpodlCheckpointCID, "expected empty genesis reference DPoDL CID");
+            }
+            // If both are empty, it's a valid reference to genesis without a DPoDL checkpoint. Carry on.
+        } else {
+            if (keccak256(abi.encodePacked(_referenceDpodlCheckpointCID)) != keccak256(abi.encodePacked(expectedReferenceDpodlCheckpointCID))) {
+                revert InvalidReferenceModel(_referenceDpodlCheckpointCID, expectedReferenceDpodlCheckpointCID);
+            }
         }
 
         // 2. Check if accuracy meets the threshold
@@ -232,21 +355,19 @@ contract ModelRegistry is Ownable {
         }
 
         // 5. Verify sufficient improvement over reference model
-        bool hasImprovedSufficiently = verifyModelImprovement(_accuracyBPS, _steps, _referenceModelCID);
+        bool hasImprovedSufficiently = verifyModelImprovement(_accuracyBPS, _steps, _referenceDpodlCheckpointCID);
         if (!hasImprovedSufficiently) {
-            // Check exactly which improvement criterion failed
-            if (bytes(_referenceModelCID).length > 0 && 
-                keccak256(abi.encodePacked(_referenceModelCID)) != keccak256(abi.encodePacked(genesisCID))) {
-                uint256 referenceBlockHeight = cidToBlockHeight[_referenceModelCID];
-                if (referenceBlockHeight > 0) {
-                    ModelBlock memory referenceBlock = modelBlocks[referenceBlockHeight];
-                    
-                    if (_accuracyBPS < referenceBlock.accuracyBPS + minAccuracyImprovementBPS) {
-                        revert InsufficientImprovement(_accuracyBPS, referenceBlock.accuracyBPS, minAccuracyImprovementBPS);
+            // More specific error about which improvement failed can be thrown by verifyModelImprovement itself if it reverts.
+            // If verifyModelImprovement returns false instead of reverting on specific failures:
+            if (bytes(_referenceDpodlCheckpointCID).length > 0) {
+                 uint256 refBlockHeight = dpodlCheckpointCIDToBlockHeight[_referenceDpodlCheckpointCID];
+                 if (refBlockHeight > 0) { // Ensure it is a valid block reference
+                    ModelBlock memory refBlock = modelBlocks[refBlockHeight];
+                    if (_accuracyBPS < refBlock.accuracyBPS + minAccuracyImprovementBPS) {
+                        revert InsufficientImprovement(_accuracyBPS, refBlock.accuracyBPS, minAccuracyImprovementBPS);
                     }
-                    
-                    if (_steps < referenceBlock.steps + minStepImprovement) {
-                        revert InsufficientTrainingSteps(_steps, referenceBlock.steps, minStepImprovement);
+                    if (_steps < refBlock.steps + minStepImprovement) {
+                        revert InsufficientTrainingSteps(_steps, refBlock.steps, minStepImprovement);
                     }
                 }
             }
@@ -259,26 +380,41 @@ contract ModelRegistry is Ownable {
 
         modelBlocks[currentBlockHeight] = ModelBlock({
             blockHeight: currentBlockHeight,
-            ipfsCID: _ipfsCID,
+            modelStateCID: _newModelStateCID,          // Store new model state CID
+            dpodlCheckpointCID: _newDpodlCheckpointCID, // Store new DPoDL checkpoint CID
             accuracyBPS: _accuracyBPS,
             steps: _steps,
             postHash: _postHash,
-            referenceModelCID: _referenceModelCID, // Storing the reference used
-            proposer: msg.sender,                  // The address calling this function
+            referenceModelCID: _referenceDpodlCheckpointCID, // Store the DPoDL checkpoint CID of the reference
+            proposer: msg.sender,
             timestamp: blockTimestamp
         });
 
-        cidToBlockHeight[_ipfsCID] = currentBlockHeight;
+        // Map the new DPoDL checkpoint CID to the new block height
+        dpodlCheckpointCIDToBlockHeight[_newDpodlCheckpointCID] = currentBlockHeight;
+
+        // Update current global CIDs to reflect this new block
+        currentModelStateCID = _newModelStateCID;
+        currentDpodlCheckpointCID = _newDpodlCheckpointCID;
 
         // --- Emit Event ---
         emit ModelAccepted(
             currentBlockHeight,
-            _ipfsCID,
+            _newModelStateCID,       // Pass new model state CID
+            _newDpodlCheckpointCID, // Pass new DPoDL checkpoint CID
             _accuracyBPS,
             _postHash,
-            _referenceModelCID,
+            _referenceDpodlCheckpointCID, // Pass reference DPoDL checkpoint CID
             msg.sender,
             blockTimestamp
+        );
+
+        emit GlobalReferenceModelUpdated(
+            currentModelStateCID, 
+            currentDpodlCheckpointCID, 
+            msg.sender, 
+            currentBlockHeight, // ID is the block height
+            true                // isBlockUpdate = true
         );
 
         // --- Reward Proposer & Reference --- 
@@ -287,24 +423,20 @@ contract ModelRegistry is Ownable {
             uint256 referenceReward = 0;
             address referenceProposer = address(0);
 
-            // Check if there's a reference and a share to distribute
-            if (bytes(_referenceModelCID).length > 0 && 
-                keccak256(abi.encodePacked(_referenceModelCID)) != keccak256(abi.encodePacked(genesisCID)) && 
-                referenceRewardShareBPS > 0)
-            {
-                uint256 referenceBlockHeight = cidToBlockHeight[_referenceModelCID];
+            // Check if there's a reference DPoDL checkpoint and a share to distribute
+            if (bytes(_referenceDpodlCheckpointCID).length > 0 && referenceRewardShareBPS > 0) {
+                // Get the block height of the reference DPoDL checkpoint
+                uint256 referenceBlockHeight = dpodlCheckpointCIDToBlockHeight[_referenceDpodlCheckpointCID];
+                
                 // Ensure reference block exists and has a proposer
                 if (referenceBlockHeight > 0 && modelBlocks[referenceBlockHeight].proposer != address(0)) {
                     referenceProposer = modelBlocks[referenceBlockHeight].proposer;
                     
-                    // Avoid giving reference reward if proposer is the same as reference proposer
                     if (referenceProposer != msg.sender) {
                         referenceReward = (blockRewardAmount * referenceRewardShareBPS) / 10000;
                         proposerReward = blockRewardAmount - referenceReward;
                     } else {
-                         // Proposer is same as reference, gets full reward
-                         // referenceProposer remains address(0) for minting logic
-                         referenceProposer = address(0);
+                         referenceProposer = address(0); // Proposer is same as reference, gets full reward
                     }
                 }
             }
@@ -331,17 +463,150 @@ contract ModelRegistry is Ownable {
         }
     }
 
+    /**
+     * @notice Updates the global reference model CIDs from a selected Model Transaction (MTX).
+     * @dev Callable only by the owner (or a designated operator in a future enhancement).
+     *      This function assumes the MTX has been validated off-chain.
+     *      It updates the current model state and DPoDL checkpoint CIDs,
+     *      and calls the MTXMempool contract to mark the MTX as Processed.
+     * @param _newModelStateCID The IPFS CID of the actual model state from the selected MTX.
+     * @param _newDpodlCheckpointCID The IPFS CID of the D-PoDL checkpoint data from the selected MTX.
+     * @param _mtxId The ID of the MTX in the MTXMempool.
+     */
+    function updateReferenceModelFromMtx(
+        string memory _newModelStateCID,
+        string memory _newDpodlCheckpointCID,
+        uint256 _mtxId
+    ) external onlyOwner { 
+        emit DebugStep(1); 
+
+        require(address(mtxMempoolContract) != address(0), "MR: MTXMempool contract address not set");
+        emit DebugStep(2); 
+        require(_mtxId > 0, "MR: MTX ID must be valid (not zero)");
+        emit DebugStep(3);
+        require(bytes(_newModelStateCID).length > 0, "MR: New model state CID cannot be empty");
+        emit DebugStep(4);
+        require(bytes(_newDpodlCheckpointCID).length > 0, "MR: New DPoDL checkpoint CID cannot be empty");
+        emit DebugStep(5);
+
+        // Update global reference CIDs
+        currentModelStateCID = _newModelStateCID; 
+        emit DebugStep(6);
+        currentDpodlCheckpointCID = _newDpodlCheckpointCID; 
+        emit DebugStep(7);
+
+        address mtxSubmitter;
+        // Other variables from getMtxDetails - declare them to avoid stack issues if not used later
+        uint256 mtxIdReturned;
+        string memory ipfsCIDReturned;
+        uint256 accuracyBPSReturned;
+        uint256 stepsReturned;
+        string memory referenceModelCIDReturned;
+        uint256 timestampReturned;
+        uint8 statusReturned; // Changed from IMTXMempool.Status
+        bool isValidReturned;
+
+        try mtxMempoolContract.getMtxDetails(_mtxId) returns (uint256, string memory, uint256, uint256, string memory, address, uint256, uint8, bool) {
+            // emit DebugStep(100); // Inside try for getMtxDetails
+            (
+                mtxIdReturned,
+                ipfsCIDReturned,
+                accuracyBPSReturned,
+                stepsReturned,
+                referenceModelCIDReturned,
+                mtxSubmitter,
+                timestampReturned,
+                statusReturned,
+                isValidReturned
+            ) = mtxMempoolContract.getMtxDetails(_mtxId);
+            // emit DebugStep(101); // After successful getMtxDetails
+        } catch (bytes memory reason) {
+            // emit DebugStep(199); // Inside catch for getMtxDetails
+            if (reason.length == 0) {
+                revert("MR: getMtxDetails failed - no reason from mempool");
+            }
+            revert(string(abi.encodePacked("MR: getMtxDetails call failed: ", reason)));
+        }
+        
+        // emit DebugStep(8);
+        require(mtxSubmitter != address(0), "MR: MTX submitter address is zero after getMtxDetails");
+        // emit DebugStep(9);
+        require(mtxRewardAmount > 0, "MR: MTX reward amount is zero, cannot mint zero reward");
+        // emit DebugStep(10);
+
+        if (address(dpdlToken) != address(0) && mtxRewardAmount > 0 && mtxSubmitter != address(0)) {
+            // emit DebugStep(200); // Inside if for token mint
+            try DPoDLToken(address(dpdlToken)).mint(mtxSubmitter, mtxRewardAmount) {
+                // emit DebugStep(201); // Inside try for mint
+                // Minting successful, an event is emitted by the token itself if it has one.
+                // We emit our specific reward event after this.
+            } catch (bytes memory reason) {
+                // emit DebugStep(299); // Inside catch for mint
+                if (reason.length == 0) {
+                    revert("MR: DPoDLToken.mint failed - no reason from token");
+                }
+                revert(string(abi.encodePacked("MR: Low-level error calling token mint: ", reason)));
+            }
+            // emit DebugStep(11); // After try-catch for mint
+            // Emit event for successful reward distribution
+            emit RewardDistributedForMtx(_mtxId, mtxSubmitter, mtxRewardAmount);
+        } else {
+            // emit DebugStep(12); // If token minting is skipped
+        }
+        
+        // emit DebugStep(13);
+        // Update MTX status in MTXMempool to Processed
+        try mtxMempoolContract.updateMtxStatus(_mtxId, uint8(IMTXMempool.Status.Processed)) { // Use the interface's enum
+            // emit DebugStep(300); // Inside try for updateMtxStatus
+            // Status updated successfully
+        } catch (bytes memory reason) {
+            // emit DebugStep(399); // Inside catch for updateMtxStatus
+            if (reason.length == 0) {
+                revert("MR: updateMtxStatus failed - no reason from mempool");
+            }
+            revert(string(abi.encodePacked("MR: updateMtxStatus call failed: ", reason)));
+        }
+        
+        // emit DebugStep(14);
+        // Emit event for global model update
+        emit GlobalReferenceModelUpdated(
+            currentModelStateCID,
+            currentDpodlCheckpointCID,
+            msg.sender, // The caller of this function (owner/operator)
+            _mtxId,     // For MTX updates, use MTX ID as the identifier
+            false       // isBlockUpdate = false
+        );
+        // emit DebugStep(15); // End of function
+    }
+
     // --- View Functions ---
 
     /**
-     * @dev Returns the IPFS CID of the latest accepted model block.
-     *      Returns the genesisCID if no blocks have been added yet.
+     * @dev OLD FUNCTION - Deprecated. Use getCurrentReferenceModelStateCID() instead.
+     * Returns the IPFS CID of the latest accepted model block's primary CID (now modelStateCID).
+     * Or returns the currentModelStateCID if no blocks have been added yet (genesis).
      */
     function getCurrentReferenceModel() public view returns (string memory) {
-        if (currentBlockHeight == 0) {
-            return genesisCID; // Or revert if genesis must be explicitly set
-        }
-        return modelBlocks[currentBlockHeight].ipfsCID;
+        // This function is kept for a brief period for compatibility if anything external still uses it,
+        // but it should be considered deprecated in favor of the more specific CIDs.
+        return currentModelStateCID;
+    }
+
+    /**
+     * @notice Gets the IPFS CID of the current reference model's STATE (the weights, etc.).
+     *         This is the model state that new training should be based on.
+     */
+    function getCurrentReferenceModelStateCID() public view returns (string memory) {
+        return currentModelStateCID;
+    }
+
+    /**
+     * @notice Gets the IPFS CID of the D-PoDL checkpoint data associated with the current reference model state.
+     *         This checkpoint contains proofs, accuracy, and other metadata for the currentModelStateCID.
+     *         May be an empty string if not applicable (e.g. for an initial genesis model without a DPoDL checkpoint).
+     */
+    function getCurrentReferenceDpodlCheckpointCID() public view returns (string memory) {
+        return currentDpodlCheckpointCID;
     }
 
     /**
@@ -354,8 +619,8 @@ contract ModelRegistry is Ownable {
     /**
      * @dev Returns the block height for a given IPFS CID, or 0 if not found.
      */
-    function getBlockHeightForCID(string memory _ipfsCID) public view returns (uint256) {
-        return cidToBlockHeight[_ipfsCID];
+    function getBlockHeightForCID(string memory _dpodlCheckpointCID) public view returns (uint256) {
+        return dpodlCheckpointCIDToBlockHeight[_dpodlCheckpointCID];
     }
 
     // --- Parameter Update Functions (Owner Controlled) ---
@@ -446,13 +711,25 @@ contract ModelRegistry is Ownable {
         emit ParameterUpdated("dpdlToken", uint256(uint160(_newTokenAddress))); // Emit address as uint
     }
 
+    // --- Setter for MTXMempool Contract Address ---
     /**
-     * @dev Sets the genesis model CID, which can only be set once when empty.
-     * @param _genesisCID The IPFS CID of the genesis model.
+     * @dev Sets the address of the MTXMempool contract.
+     *      Only callable by the owner.
+     * @param _mtxMempoolAddress The address of the MTXMempool contract.
      */
-    function setGenesisCID(string memory _genesisCID) public onlyOwner {
-        if (bytes(genesisCID).length > 0) revert("Genesis CID already set");
-        if (bytes(_genesisCID).length == 0) revert("Genesis CID cannot be empty");
-        genesisCID = _genesisCID;
+    function setMtxMempoolContract(address _mtxMempoolAddress) external onlyOwner {
+        if (_mtxMempoolAddress == address(0)) revert ZeroAddress();
+        mtxMempoolContract = IMTXMempool(_mtxMempoolAddress);
+        // Optionally emit an event here if needed, e.g.:
+        // emit ContractAddressUpdated("MTXMempool", _mtxMempoolAddress);
+    }
+
+    /**
+     * @dev Updates the MTX reward amount. Only callable by the owner.
+     * @param _newRewardAmount The new reward amount per processed MTX.
+     */
+    function setMtxRewardAmount(uint256 _newRewardAmount) public onlyOwner {
+        mtxRewardAmount = _newRewardAmount;
+        emit ParameterUpdated("mtxRewardAmount", _newRewardAmount);
     }
 } 

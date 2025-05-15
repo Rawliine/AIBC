@@ -16,6 +16,32 @@ logger = logging.getLogger(__name__) # Or use your project's custom logger if it
 # Global IPFS client instance
 _ipfs_client = None
 
+def _prepare_dict_for_pickle(data_dict):
+    """Recursively prepares a dictionary for pickling by moving tensors to CPU."""
+    if not isinstance(data_dict, dict):
+        return data_dict # Only process dicts
+
+    prepared_dict = {}
+    for key, value in data_dict.items():
+        if isinstance(value, torch.Tensor):
+            prepared_dict[key] = value.cpu()
+        elif isinstance(value, dict):
+            prepared_dict[key] = _prepare_dict_for_pickle(value) # Recurse for nested dicts
+        elif isinstance(value, list):
+            # Process lists: create a new list with processed items
+            prepared_list = []
+            for item in value:
+                if isinstance(item, torch.Tensor):
+                    prepared_list.append(item.cpu())
+                elif isinstance(item, dict):
+                    prepared_list.append(_prepare_dict_for_pickle(item))
+                else:
+                    prepared_list.append(item)
+            prepared_dict[key] = prepared_list
+        else:
+            prepared_dict[key] = value
+    return prepared_dict
+
 def get_ipfs_client():
     global _ipfs_client
     if _ipfs_client is None:
@@ -184,11 +210,13 @@ async def save_checkpoint_data_to_ipfs(checkpoint_data: dict, name: str = "dpodl
         if not client:
             return None
 
+        # Prepare the dictionary for pickling (move tensors to CPU)
+        prepared_checkpoint_data = _prepare_dict_for_pickle(checkpoint_data)
+
         # Convert checkpoint data (dict) to bytes (e.g., using JSON)
         buffer = io.BytesIO()
         # Use pickle or json to serialize the dictionary
-        import pickle
-        pickle.dump(checkpoint_data, buffer)
+        torch.save(prepared_checkpoint_data, buffer)
         buffer.seek(0)
         data_bytes = buffer.read()
 
@@ -215,6 +243,27 @@ def load_checkpoint_data_from_ipfs(cid: str, name: str) -> dict | None:
         return None
     except Exception as e:
         logger.error(f"Error loading checkpoint data '{name}' from IPFS (CID: {cid}): {e}")
+        return None
+
+def load_pickled_dict_from_ipfs(cid: str, name: str = "dpodl_checkpoint_pickle") -> dict | None:
+    """Loads a pickled dictionary (like D-PoDL checkpoint state) from IPFS given a CID."""
+    try:
+        pickled_bytes = load_data_from_ipfs(cid)
+        if pickled_bytes:
+            # import pickle # No longer using pickle directly for loading here
+            import io      # For BytesIO
+            import torch   # For torch.load
+            buffer = io.BytesIO(pickled_bytes)
+            # Use torch.load, as it can handle pickled Python objects and also
+            # PyTorch tensors, including those with persistent_id issues.
+            # map_location can be useful if loading CUDA tensors on CPU.
+            data_dict = torch.load(buffer, map_location=torch.device('cpu'))
+            logger.info(f"Data '{name}' loaded and unpickled using torch.load from IPFS (CID: {cid})")
+            return data_dict
+        return None
+    # torch.load can raise various errors, including pickle.UnpicklingError or RuntimeError
+    except Exception as e: 
+        logger.error(f"Error loading/unpickling data for '{name}' from IPFS using torch.load (CID: {cid}): {e}", exc_info=True)
         return None
 
 def merge_model_states(state_dicts: list[dict]) -> dict:

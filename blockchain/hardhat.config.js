@@ -16,7 +16,16 @@ const sepoliaAccounts = PRIVATE_KEY && PRIVATE_KEY.startsWith("0x") && PRIVATE_K
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
-  solidity: "0.8.20",
+  solidity: {
+    version: "0.8.20",
+    settings: {
+      optimizer: {
+        enabled: true,
+        runs: 200, // Standard default, can be adjusted
+      },
+      viaIR: true, // Enable the IR-based compilation pipeline
+    },
+  },
   defaultNetwork: "hardhat",
   networks: {
     hardhat: {

@@ -89,26 +89,26 @@ def save_checkpoint(
     # --- IPFS Upload (Conditional) ---
     ipfs_cid = None
     if upload_to_ipfs_flag:
-        try:
+    try:
             client = ipfshttpclient.connect('/ip4/127.0.0.1/tcp/5001', timeout=5)
-            client.version() 
+        client.version() 
+        
+        res = client.add(checkpoint_path)
+        ipfs_cid = res['Hash']
+        logger.info(f"Checkpoint uploaded to IPFS. CID: {ipfs_cid}")
+        
+        try:
+            with open('checkpoint_cids.txt', 'a') as f:
+                f.write(f"{epoch},{ipfs_cid},{checkpoint_path}\n")
+        except Exception as f_err:
+            logger.warning(f"Failed to write CID to checkpoint_cids.txt: {f_err}")
             
-            res = client.add(checkpoint_path)
-            ipfs_cid = res['Hash']
-            logger.info(f"Checkpoint uploaded to IPFS. CID: {ipfs_cid}")
-            
-            try:
-                with open('checkpoint_cids.txt', 'a') as f:
-                    f.write(f"{epoch},{ipfs_cid},{checkpoint_path}\n")
-            except Exception as f_err:
-                logger.warning(f"Failed to write CID to checkpoint_cids.txt: {f_err}")
-                
-        except ipfshttpclient.exceptions.ConnectionError:
-            logger.warning(f"IPFS connection failed (daemon not running?). Checkpoint CID not generated for {checkpoint_path}.")
+    except ipfshttpclient.exceptions.ConnectionError:
+        logger.warning(f"IPFS connection failed (daemon not running?). Checkpoint CID not generated for {checkpoint_path}.")
             # Return local path if IPFS fails but local save worked
             return checkpoint_path # Or None, depending on desired behavior on IPFS fail
-        except Exception as e:
-            logger.error(f"An error occurred during IPFS upload for {checkpoint_path}: {e}")
+    except Exception as e:
+        logger.error(f"An error occurred during IPFS upload for {checkpoint_path}: {e}")
             # Return local path if IPFS fails
             return checkpoint_path # Or None
     else:

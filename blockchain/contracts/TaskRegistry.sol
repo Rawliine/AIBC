@@ -175,7 +175,6 @@ contract TaskRegistry is Ownable {
              revert InvalidTaskStatusTransition(_taskId, task.status, TaskStatus.Cancelled);
         }
 
-        TaskStatus previousStatus = task.status;
         task.status = TaskStatus.Cancelled;
         task.endTimestamp = block.timestamp;
 

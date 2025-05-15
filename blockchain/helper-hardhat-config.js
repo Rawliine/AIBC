@@ -21,12 +21,17 @@ const parseEther = (value) => {
     return ethers.BigNumber.from(value).mul(ethers.BigNumber.from(10).pow(18));
   }
 };
-const initialBlockRewardAmount = parseEther("10"); // 10 DPDL tokens per block
+const initialBlockRewardAmount = parseEther("100"); // 100 DPDL tokens per block
 const initialMinTrainingSteps = 100;      // Minimum training steps required
 const initialMaxTrainingSteps = 10000;    // Maximum training steps allowed
 const initialMinAccuracyImprovementBPS = 100; // Require at least 1% accuracy improvement
 const initialMinStepImprovement = 50;     // Require at least 50 additional training steps
 const initialReferenceRewardShareBPS = 2000; // Example: 20% reward share for reference proposer
+
+// New parameters for ModelRegistry constructor
+const initialGenesisModelStateCID = "Qm__GENESIS_MODEL_STATE_CID_CONFIGURABLE__"; // Replace with actual CID for real deployments
+const initialGenesisDpodlCheckpointCID = "Qm__GENESIS_DPODL_CHECKPOINT_CID_CONFIGURABLE__"; // Can be empty: "" if no DPoDL checkpoint for genesis
+const initialMtxRewardAmount = parseEther("50"); // 50 DPDL tokens for a processed MTX
 
 module.exports = {
     developmentChains,
@@ -38,12 +43,17 @@ module.exports = {
     initialMinAccuracyImprovementBPS,
     initialMinStepImprovement,
     initialReferenceRewardShareBPS,
+    initialGenesisModelStateCID,      // Export new param
+    initialGenesisDpodlCheckpointCID, // Export new param
+    initialMtxRewardAmount,           // Export new param
     31337: { // Hardhat network
         // Only add values here if they should override the common defaults
     },
     1: { // Ethereum mainnet
         // Production values would go here
         // initialT1Threshold: "harder_value_for_production",
+        // initialGenesisModelStateCID: "QmActualMainnetGenesisModel",
+        // initialMtxRewardAmount: parseEther("10"),
     },
     // Add more networks as needed
 }; 

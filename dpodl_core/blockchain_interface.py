@@ -1,11 +1,16 @@
 import os
 import time
 import logging
+import json
 from web3 import Web3
 # from web3.middleware import geth_poa_middleware # Old import
 # Try importing directly from the specific module
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
-from web3.exceptions import TransactionNotFound
+from web3.exceptions import TransactionNotFound, ContractLogicError
+from web3.logs import EventLogErrorFlags # Import EventLogErrorFlags
+from eth_account import Account
+from eth_account.datastructures import SignedTransaction
+from dotenv import load_dotenv
 
 # Import config and contract info loader
 from .blockchain_config import NETWORK_URL, CHAIN_ID, get_contract_info
@@ -24,6 +29,8 @@ w3 = None
 registry_contract = None
 mempool_contract = None
 token_contract = None
+
+TX_TIMEOUT = int(os.getenv("TX_TIMEOUT", "300"))
 
 def initialize_blockchain_connection():
     global w3, registry_contract, mempool_contract, token_contract
@@ -105,16 +112,145 @@ def get_token():
 
 def get_current_reference_cid() -> str | None:
     """Gets the current reference model CID from the ModelRegistry."""
+    logger.warning("DEPRECATED: get_current_reference_cid() is deprecated. Use get_current_reference_model_state_cid() or get_current_reference_dpodl_checkpoint_cid().")
+    # For backward compatibility during transition, it can call the new model_state_cid function
+    return get_current_reference_model_state_cid()
+
+def get_current_reference_model_state_cid() -> str | None:
+    """Gets the current reference model's STATE CID from the ModelRegistry."""
     registry = get_registry()
     if not registry:
         return None
     try:
-        logger.debug("Calling ModelRegistry.getCurrentReferenceModel()...")
-        cid = registry.functions.getCurrentReferenceModel().call()
-        logger.info(f"Current reference model CID from registry: {cid}")
+        logger.debug("Calling ModelRegistry.getCurrentReferenceModelStateCID()...")
+        cid = registry.functions.getCurrentReferenceModelStateCID().call()
+        logger.info(f"Current reference model state CID from registry: {cid}")
         return cid
     except Exception as e:
-        logger.error(f"Error calling getCurrentReferenceModel: {e}", exc_info=True)
+        logger.error(f"Error calling getCurrentReferenceModelStateCID: {e}", exc_info=True)
+        return None
+
+def get_current_reference_dpodl_checkpoint_cid() -> str | None:
+    """Gets the current reference model's DPoDL CHECKPOINT CID from the ModelRegistry."""
+    registry = get_registry()
+    if not registry:
+        return None
+    try:
+        logger.debug("Calling ModelRegistry.getCurrentReferenceDpodlCheckpointCID()...")
+        cid = registry.functions.getCurrentReferenceDpodlCheckpointCID().call()
+        logger.info(f"Current reference DPoDL checkpoint CID from registry: {cid}")
+        return cid
+    except Exception as e:
+        logger.error(f"Error calling getCurrentReferenceDpodlCheckpointCID: {e}", exc_info=True)
+        return None
+
+# --- MTXMempool Read Functions ---
+MTX_STATUS_MAP = {
+    0: "Pending",
+    1: "SelectedForProcessing",
+    2: "Processed",
+    3: "Rejected"
+}
+
+def get_mtx_mempool_count() -> int | None:
+    """Gets the current total number of MTXs submitted to MTXMempool."""
+    mempool = get_mempool()
+    if not mempool:
+        return None
+    try:
+        logger.debug("Calling MTXMempool.getMtxCount()...")
+        count = mempool.functions.getMtxCount().call()
+        logger.info(f"MTXMempool count: {count}")
+        return count
+    except Exception as e:
+        logger.error(f"Error calling MTXMempool.getMtxCount: {e}", exc_info=True)
+        return None
+
+def get_mtx_details(mtx_id: int) -> dict | None:
+    """Gets the details of a specific MTX by its ID from MTXMempool."""
+    mempool = get_mempool()
+    if not mempool:
+        return None
+    try:
+        logger.debug(f"Calling MTXMempool.getMtxDetails({mtx_id})...")
+        # The order of fields in the returned tuple matches the struct definition in Solidity
+        # struct ModelTransaction {
+        #     uint256 mtxId;
+        #     string ipfsCID;
+        #     uint256 accuracyBPS;
+        #     uint256 steps;
+        #     string referenceModelCID;
+        #     address submitter;
+        #     uint256 timestamp;
+        #     Status status; // enum will be an int (0-3)
+        #     bool isValid;
+        # }
+        details_tuple = mempool.functions.getMtxDetails(mtx_id).call()
+        
+        if not details_tuple[8]: # Check isValid flag
+            logger.warning(f"MTX ID {mtx_id} is not valid or has been marked invalid.")
+            return None
+
+        details_dict = {
+            "mtxId": details_tuple[0],
+            "ipfsCID": details_tuple[1],
+            "accuracyBPS": details_tuple[2],
+            "steps": details_tuple[3],
+            "referenceModelCID": details_tuple[4],
+            "submitter": details_tuple[5],
+            "timestamp": details_tuple[6],
+            "status_raw": details_tuple[7],
+            "status_str": MTX_STATUS_MAP.get(details_tuple[7], "UnknownStatus"),
+            "isValid": details_tuple[8]
+        }
+        logger.info(f"MTX {mtx_id} details: {details_dict}")
+        return details_dict
+    except Exception as e:
+        # Check if it's due to our custom InvalidMtxId error (if web3.py surfaces it clearly)
+        # For now, general catch
+        logger.error(f"Error calling MTXMempool.getMtxDetails({mtx_id}): {e}", exc_info=True)
+        return None
+
+def fetch_pending_mtxs() -> list:
+    """Fetches all MTXs from MTXMempool that are in 'Pending' status."""
+    pending_mtxs = []
+    total_mtx_count = get_mtx_mempool_count()
+
+    if total_mtx_count is None:
+        logger.error("Could not fetch total MTX count. Cannot fetch pending MTXs.")
+        return pending_mtxs # Return empty list
+    
+    if total_mtx_count == 0:
+        logger.info("No MTXs in the mempool.")
+        return pending_mtxs
+
+    logger.info(f"Total MTXs to check: {total_mtx_count}")
+    for i in range(1, total_mtx_count + 1): # MTX IDs start from 1
+        details = get_mtx_details(i)
+        if details and details["status_raw"] == 0: # 0 is Status.Pending
+            pending_mtxs.append(details)
+            logger.debug(f"Added pending MTX ID {i} to the list.")
+        elif not details:
+            logger.warning(f"Could not retrieve details for MTX ID {i}, skipping.")
+            # This could happen if an ID was skipped or if there's an issue with an MTX
+    
+    logger.info(f"Found {len(pending_mtxs)} MTXs in Pending status.")
+    return pending_mtxs
+
+# --- New function to get MTXMempool address from ModelRegistry --- #
+def get_model_registry_mempool_address() -> str | None:
+    """Reads the mtxMempoolContract address set in the ModelRegistry contract."""
+    registry = get_registry()
+    if not registry:
+        logger.error("ModelRegistry contract not loaded, cannot get its MTXMempool address.")
+        return None
+    try:
+        logger.debug("Calling ModelRegistry.mtxMempoolContract()...")
+        address = registry.functions.mtxMempoolContract().call()
+        logger.info(f"MTXMempool address configured in ModelRegistry: {address}")
+        return address
+    except Exception as e:
+        logger.error(f"Error calling ModelRegistry.mtxMempoolContract(): {e}", exc_info=True)
         return None
 
 # Add other read functions as needed (e.g., get_t1_threshold, get_mtx_details)
@@ -128,8 +264,37 @@ def _send_signed_transaction(w3_instance, chain_id, transaction, private_key):
         address = account.address
         logger.info(f"Signing transaction using address: {address}")
 
+        # Ensure 'from' field is set for eth_call and estimate_gas
+        if 'from' not in transaction:
+            transaction['from'] = address
+        elif transaction['from'] != address:
+            logger.warning(f"Transaction 'from' field {transaction['from']} differs from signer {address}. Overwriting.")
+            transaction['from'] = address
+
         # Remove legacy gasPrice if it exists (shouldn't, but defensively)
         transaction.pop('gasPrice', None)
+
+        # Attempt eth_call to get potential revert reason before estimating gas
+        try:
+            logger.debug(f"Attempting eth_call for transaction: {transaction}")
+            # For eth_call, we don't need nonce, gas, maxFeePerGas, maxPriorityFeePerGas yet.
+            # A copy of the transaction without these might be safer for eth_call.
+            call_tx = transaction.copy()
+            call_tx.pop('nonce', None)
+            call_tx.pop('gas', None)
+            call_tx.pop('maxFeePerGas', None)
+            call_tx.pop('maxPriorityFeePerGas', None)
+            # Ensure 'from' is present for eth_call
+            if 'from' not in call_tx:
+                 call_tx['from'] = address
+
+            call_result = w3_instance.eth.call(call_tx, 'latest')
+            logger.debug(f"eth_call successful. Result: {call_result.hex() if isinstance(call_result, bytes) else call_result}")
+        except Exception as call_e: # Catching a broad exception to see any error from eth_call
+            logger.error(f"eth_call FAILED before gas estimation. Error: {call_e}", exc_info=True)
+            # If it's a ContractLogicError, it might contain the revert reason we need.
+            # We can choose to re-raise or just log and let estimate_gas try.
+            # For now, just log and proceed to estimate_gas, as estimate_gas itself might also fail with a reason.
 
         # Estimate gas limit
         try:
@@ -206,17 +371,48 @@ def _send_signed_transaction(w3_instance, chain_id, transaction, private_key):
 
         # Wait for receipt (consider timeout)
         logger.info("Waiting for transaction receipt...")
-        # Set a reasonable timeout, e.g., 120 seconds
-        receipt = w3_instance.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-        logger.info(f"Transaction confirmed. Block: {receipt.blockNumber}, Gas used: {receipt.gasUsed}")
+        try:
+            receipt = w3_instance.eth.wait_for_transaction_receipt(tx_hash, timeout=TX_TIMEOUT)
+            # Log more details from the receipt, ensuring it's not excessively verbose unless debugging
+            log_receipt_details(receipt) 
         
         if receipt.status == 0:
-             logger.error(f"Transaction FAILED! Receipt: {receipt}")
-             # Consider raising an exception here
-             return None
-             
-        return receipt
+                logger.error(f"Transaction failed (receipt.status == 0).")
+                # Attempt to get revert reason by replaying the transaction using eth_call at the block before it was mined
+                try:
+                    tx_details = w3_instance.eth.get_transaction(tx_hash)
+                    if tx_details and tx_details.get('blockNumber') is not None:
+                        call_params = {
+                            'to': tx_details.get('to'),
+                            'from': tx_details.get('from'), # Original EOA sender
+                            'value': tx_details.get('value'),
+                            'data': tx_details.get('input'), # 'input' is the data field for historical transactions
+                            # Add gas and gasPrice if they were part of the original tx, or allow eth_call to use defaults
+                            'gas': tx_details.get('gas'),
+                            'gasPrice': tx_details.get('gasPrice')
+                        }
+                        # Remove None values to avoid issues with eth_call
+                        call_params = {k: v for k, v in call_params.items() if v is not None}
+                        
+                        logger.info(f"Attempting to get revert reason by re-calling failed tx (hash: {tx_hash.hex()}) at block {tx_details.blockNumber - 1}")
+                        revert_call_result = w3_instance.eth.call(call_params, tx_details.blockNumber - 1)
+                        logger.error(f"  eth_call result for failed tx: {revert_call_result.hex() if isinstance(revert_call_result, bytes) else revert_call_result}")
+                        # Basic attempt to decode common string revert: Error(string)
+                        if isinstance(revert_call_result, bytes) and revert_call_result.startswith(bytes.fromhex('08c379a0')):
+                            reason = w3_instance.codec.decode(['string'], revert_call_result[4:])[0]
+                            logger.error(f"  Decoded revert reason: {reason}")
+                        else:
+                            logger.error(f"  Could not decode standard string revert reason from result.")
+                    else:
+                        logger.error("Could not get transaction details or blockNumber to attempt fetching revert reason.")
+                except ContractLogicError as cle:
+                     logger.error(f"  Re-call for revert reason failed with ContractLogicError. Message: '{cle.message}'. Data: {cle.data if hasattr(cle, 'data') else 'N/A'}")
+                except Exception as e_call_revert:
+                    logger.error(f"  Could not fetch revert reason via eth_call: {e_call_revert}", exc_info=True)
+                return {"tx_hash": tx_hash.hex(), "receipt": receipt, "error": "Transaction reverted with status 0", "status": 0}
 
+            logger.info(f"Transaction confirmed. Block: {receipt.blockNumber}, Gas used: {receipt.gasUsed}")
+            return {"tx_hash": tx_hash.hex(), "receipt": receipt, "status": 1}
     except TransactionNotFound:
         logger.error(f"Transaction {tx_hash.hex()} not found after timeout.")
         return None
@@ -226,11 +422,12 @@ def _send_signed_transaction(w3_instance, chain_id, transaction, private_key):
 
 
 def submit_block(
-    ipfs_cid: str,
+    new_model_state_cid: str,
+    new_dpodl_checkpoint_cid: str,
     accuracy_bps: int,
     steps: int,
-    post_hash: int, # Assuming post_hash is uint256 in contract
-    reference_cid: str,
+    post_hash: int,
+    reference_dpodl_checkpoint_cid: str,
     signer_private_key: str
 ) -> dict | None:
     """Submits a block to the ModelRegistry contract."""
@@ -244,25 +441,21 @@ def submit_block(
          return None
 
     try:
-        logger.info(f"Building submitBlock transaction for CID: {ipfs_cid}")
-        # Ensure accuracy_bps and steps are ints if needed by web3.py (should handle python ints/bigints)
-        # Convert post_hash hex string to integer if necessary (assuming int input here)
-        # Ensure reference_cid is string
+        logger.info(f"Building submitBlock transaction for Model State CID: {new_model_state_cid}, DPoDL Checkpoint CID: {new_dpodl_checkpoint_cid}")
 
         transaction = registry.functions.submitBlock(
-            ipfs_cid,
+            new_model_state_cid,
+            new_dpodl_checkpoint_cid,
             accuracy_bps,
             steps,
-            post_hash, # Pass as int/bigint
-            reference_cid
+            post_hash,
+            reference_dpodl_checkpoint_cid
         ).build_transaction({
-            # 'from': account.address, # Let helper handle this
-            # 'nonce': w3.eth.get_transaction_count(account.address),
-            # Gas/GasPrice/ChainID handled by helper
+            # Params handled by helper
         })
         
         receipt = _send_signed_transaction(w3_conn, CHAIN_ID, transaction, signer_private_key)
-        return receipt # Return receipt (or None on failure)
+        return receipt
 
     except Exception as e:
         logger.error(f"Error building or sending submitBlock transaction: {e}", exc_info=True)
@@ -275,10 +468,12 @@ def submit_mtx(
     reference_cid: str,
     signer_private_key: str
 ) -> dict | None:
-    """Submits a model transaction (MTX) to the MTXMempool contract."""
+    """Submits a model transaction (MTX) to the MTXMempool contract.
+    Returns a dictionary containing the receipt and the parsed mtxId if successful, else None.
+    """
     w3_conn = get_w3()
-    mempool = get_mempool()
-    if not w3_conn or not mempool:
+    mempool_contract_instance = get_mempool() # Renamed for clarity from global 'mempool'
+    if not w3_conn or not mempool_contract_instance:
         logger.error("Cannot submit MTX: Interface not initialized.")
         return None
     if not signer_private_key:
@@ -287,7 +482,7 @@ def submit_mtx(
 
     try:
         logger.info(f"Building submitMtx transaction for CID: {ipfs_cid}")
-        transaction = mempool.functions.submitMtx(
+        transaction = mempool_contract_instance.functions.submitMtx(
             ipfs_cid,
             accuracy_bps,
             steps,
@@ -296,12 +491,78 @@ def submit_mtx(
             # Params handled by helper
         })
 
-        receipt = _send_signed_transaction(w3_conn, CHAIN_ID, transaction, signer_private_key)
-        return receipt
+        # receipt = _send_signed_transaction(w3_conn, CHAIN_ID, transaction, signer_private_key) # Old call
+        send_result = _send_signed_transaction(w3_conn, CHAIN_ID, transaction, signer_private_key)
+        
+        if send_result and send_result.get("status") == 1:
+            actual_receipt = send_result.get("receipt") # This is the actual receipt object
+            tx_hash_hex = send_result.get("tx_hash")
+            logger.info(f"MTX submission transaction successful. TxHash: {tx_hash_hex}. Parsing MtxSubmitted event...")
+            try:
+                # Correctly use the EventLogErrorFlags enum and the actual receipt object
+                events = mempool_contract_instance.events.MtxSubmitted().process_receipt(actual_receipt, errors=EventLogErrorFlags.Warn)
+                if events:
+                    parsed_mtx_id = events[0]['args']['mtxId']
+                    logger.info(f"Successfully parsed MtxSubmitted event. MTX ID: {parsed_mtx_id}")
+                    return {"tx_hash": tx_hash_hex, "receipt": actual_receipt, "mtxId": parsed_mtx_id, "status": 1}
+                else:
+                    logger.warning("MtxSubmitted event not found in transaction receipt logs, though transaction was successful.")
+                    return {"tx_hash": tx_hash_hex, "receipt": actual_receipt, "mtxId": None, "status": 1} # Return receipt but indicate mtxId parsing failure
+            except Exception as e_event_parsing: 
+                logger.error(f"Error parsing MtxSubmitted event: {e_event_parsing}", exc_info=True)
+                return {"tx_hash": tx_hash_hex, "receipt": actual_receipt, "mtxId": None, "status": 1} # Return receipt but indicate mtxId parsing failure
+        elif send_result: # Transaction failed but we got a result dictionary (e.g. status 0)
+            logger.error(f"MTX submission transaction failed. Result: {send_result}")
+            return send_result # Forward the error result
+        else: # _send_signed_transaction returned None (e.g. timeout before receipt)
+            logger.error("MTX submission failed: No result from _send_signed_transaction.")
+            return None
 
     except Exception as e:
         logger.error(f"Error building or sending submitMtx transaction: {e}", exc_info=True)
         return None
+
+def update_reference_model_from_mtx(
+    model_state_cid: str,
+    dpodl_checkpoint_cid: str,
+    mtx_id: int,
+    signer_private_key: str
+) -> dict | None:
+    """Calls updateReferenceModelFromMtx in ModelRegistry.sol."""
+    w3_conn = get_w3()
+    registry = get_registry()
+    if not w3_conn or not registry:
+        logger.error("Cannot update reference model from MTX: Interface not initialized.")
+        return None
+    if not signer_private_key:
+         logger.error("Cannot update reference model from MTX: Signer private key required.")
+         return None
+
+    try:
+        logger.info(f"Building updateReferenceModelFromMtx transaction for MTX ID: {mtx_id}, ModelStateCID: {model_state_cid}, DpodlCheckpointCID: {dpodl_checkpoint_cid}")
+        transaction = registry.functions.updateReferenceModelFromMtx(
+            model_state_cid,
+            dpodl_checkpoint_cid,
+            mtx_id
+        ).build_transaction({
+            # Params handled by helper
+        })
+
+        receipt = _send_signed_transaction(w3_conn, CHAIN_ID, transaction, signer_private_key)
+        return receipt
+
+    except Exception as e:
+        logger.error(f"Error building or sending updateReferenceModelFromMtx transaction: {e}", exc_info=True)
+        return None
+
+def log_receipt_details(receipt):
+    if logger.getEffectiveLevel() <= logging.DEBUG: # Only log full receipt if debug level is set
+        logger.debug(f"Full Transaction Receipt: {json.dumps(json.loads(Web3.to_json(receipt)), indent=2)}")
+    else:
+        logger.info(
+            f"Receipt Status: {receipt.status}, Block: {receipt.blockNumber}, " 
+            f"GasUsed: {receipt.gasUsed}, TxHash: {receipt.transactionHash.hex()}"
+        )
 
 # Example usage (if run directly)
 if __name__ == '__main__':
@@ -313,8 +574,10 @@ if __name__ == '__main__':
         print(f"Network URL: {NETWORK_URL}")
         print(f"Chain ID: {CHAIN_ID}")
         # Test reading current reference
-        current_ref = get_current_reference_cid()
-        print(f"Current Reference CID: {current_ref}")
+        current_model_state_ref = get_current_reference_model_state_cid()
+        current_dpodl_checkpoint_ref = get_current_reference_dpodl_checkpoint_cid()
+        print(f"Current Reference Model State CID: {current_model_state_ref}")
+        print(f"Current Reference DPoDL Checkpoint CID: {current_dpodl_checkpoint_ref}")
 
         # Example Transaction (requires a PRIVATE_KEY in .env for local node testing)
         test_private_key = os.getenv('TEST_WORKER_PRIVATE_KEY') # Add this to .env for testing
@@ -329,20 +592,20 @@ if __name__ == '__main__':
              dummy_ref = get_current_reference_cid() or "" # Use current or genesis
              
              print(f"Submitting dummy block: CID={dummy_cid}, Acc={dummy_acc}, Steps={dummy_steps}, PostHash={dummy_post_hash}, Ref={dummy_ref}")
-             block_receipt = submit_block(
-                 dummy_cid, 
-                 dummy_acc, 
-                 dummy_steps, 
-                 dummy_post_hash, 
-                 dummy_ref, 
-                 test_private_key
-             )
-             if block_receipt:
-                  print(f"  Block submission SUCCESS! Tx Hash: {block_receipt.transactionHash.hex()}")
-                  # Update reference for potential MTX test
-                  dummy_ref = dummy_cid 
-             else:
-                  print("  Block submission FAILED.")
+             # block_receipt = submit_block(
+             #     dummy_cid, # This was single ipfsCID, now needs model_state_cid and dpodl_checkpoint_cid
+             #     dummy_acc, 
+             #     dummy_steps, 
+             #     dummy_post_hash, 
+             #     dummy_ref, # This was single reference_cid, now needs reference_dpodl_checkpoint_cid
+             #     test_private_key
+             # )
+             # if block_receipt:
+             #      print(f"  Block submission SUCCESS! Tx Hash: {block_receipt.transactionHash.hex()}")
+             #      # Update reference for potential MTX test
+             #      dummy_ref = dummy_cid 
+             # else:
+             #      print("  Block submission FAILED.")
              
              # Test MTX submission
              dummy_mtx_cid = f"QmTestMtxCID_{int(time.time())}"

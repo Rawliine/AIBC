@@ -4,6 +4,7 @@ import ray
 import torch
 import logging
 import argparse
+import traceback
 
 # Ray AIR / train
 from ray.train.torch import TorchTrainer
@@ -14,26 +15,34 @@ from ray.train import Checkpoint, FailureConfig
 from .data_loader import load_dataset_and_partition
 from .worker import worker_train_loop  # Import the worker loop
 from .utils import logger # Import logger if configured globally
-# Import the blockchain interface function
-from .blockchain_interface import get_current_reference_cid
+# Import the blockchain interface functions
+from .blockchain_interface import (
+    get_current_reference_model_state_cid, 
+    get_current_reference_dpodl_checkpoint_cid,
+    fetch_pending_mtxs,
+    update_reference_model_from_mtx, # Added for MTX processing
+    # Add the new debug function import here if it makes sense, or call it directly
+    # For now, assume it will be added to blockchain_interface and called
+)
 from .config_utils import get_config # Import the new config utility
+from .ipfs_utils import load_pickled_dict_from_ipfs # Added for MTX processing
 
 # Configure logging if not already done globally
 # logging.basicConfig(level=logging.INFO) 
 # logger = logging.getLogger("dpodl_trainer")
 
 # --- Simulated Mempool for Model Transactions (MTX) ---
-global mtx_mempool
-mtx_mempool = [] # Global or passed around in a real system
+# global mtx_mempool # This was a placeholder, actual MTXs are on-chain
+# mtx_mempool = [] 
 
-def select_best_mtx(mempool):
-    """Selects the 'best' mtx from the mempool (e.g., highest accuracy)."""
-    if not mempool:
-        return None
-    # Simple selection: highest accuracy. Could be more complex (steps, lineage, etc.)
-    best_mtx = max(mempool, key=lambda x: x.get('accuracy', 0.0))
-    logger.info(f"Selected best mtx from mempool: CID {best_mtx.get('ipfs_cid')}, Acc {best_mtx.get('accuracy'):.4f}")
-    return best_mtx
+# def select_best_mtx(mempool):
+# """Selects the 'best' mtx from the mempool (e.g., highest accuracy)."""
+# if not mempool:
+# return None
+# # Simple selection: highest accuracy. Could be more complex (steps, lineage, etc.)
+# best_mtx = max(mempool, key=lambda x: x.get('accuracy', 0.0))
+# logger.info(f"Selected best mtx from mempool: CID {best_mtx.get('ipfs_cid')}, Acc {best_mtx.get('accuracy'):.4f}")
+# return best_mtx
 # ------------------------------------------------------
 
 def run_training(
@@ -93,27 +102,38 @@ def run_training(
     val_partition = data_loaded["val_dataset"] # Assuming val_dataset is suitable for all workers
     logger.info(f"Dataset loaded. Train partitions: {len(train_partitions)}, Val dataset: {val_partition}")
 
-    # --- Determine Reference Model ID for this run --- 
-    # Use the one passed in, otherwise get from the blockchain registry
-    # current_reference_model_id = app_config["reference_model_id"] # Use config value
-    # Simplification: Always try to fetch from blockchain unless explicitly set in config for testing
+    # --- Determine Reference Model CIDs for this run --- 
+    # These are the CIDs that workers will base their training on.
     
-    if app_config.get("reference_model_id_override") is not None: # Allow test override
-        current_reference_model_id = app_config["reference_model_id_override"]
-        logger.info(f"Using overridden reference_model_id from config: {current_reference_model_id}")
-    elif app_config["reference_model_id"]:
-        current_reference_model_id = app_config["reference_model_id"]
-        logger.info(f"Using provided reference_model_id from config: {current_reference_model_id}")
+    # Try to get reference model state CID override from config first (for testing)
+    current_ref_model_state_cid_for_run = app_config.get("reference_model_id_override") # Assuming this key means model_state_cid override
+    current_ref_dpodl_checkpoint_cid_for_run = app_config.get("reference_dpodl_checkpoint_cid_override") # New override for DPoDL checkpoint
+
+    if current_ref_model_state_cid_for_run is not None:
+        logger.info(f"Using overridden reference_model_state_cid from config: {current_ref_model_state_cid_for_run}")
+        if current_ref_dpodl_checkpoint_cid_for_run is None:
+            logger.warning("reference_model_id_override is set, but reference_dpodl_checkpoint_cid_override is not. DPoDL checkpoint CID will be None.")
     else:
-        logger.info("No reference_model_id in config. Querying blockchain registry...")
-        current_reference_model_id = get_current_reference_cid()
-        if not current_reference_model_id:
-            # Handle case where blockchain call fails or returns empty (genesis)
-            logger.warning("Failed to get reference CID from registry or registry is at genesis. Starting fresh.")
-            current_reference_model_id = None # Ensure it's None if empty or error
+        logger.info("No reference_model_id_override in config. Querying blockchain registry...")
+        current_ref_model_state_cid_for_run = get_current_reference_model_state_cid()
+        current_ref_dpodl_checkpoint_cid_for_run = get_current_reference_dpodl_checkpoint_cid()
+
+        if not current_ref_model_state_cid_for_run:
+            logger.warning("Failed to get reference model state CID from registry or registry is at genesis (empty state CID). Starting fresh or from absolute genesis.")
+            # current_ref_model_state_cid_for_run will be None or empty string from contract
         else:
-            logger.info(f"Using current reference model from registry: {current_reference_model_id}")
-    # ----------------------------------------------------
+            logger.info(f"Using current reference model state CID from registry: {current_ref_model_state_cid_for_run}")
+        
+        if not current_ref_dpodl_checkpoint_cid_for_run:
+            logger.info("Current reference DPoDL checkpoint CID from registry is None/empty.")
+        else:
+            logger.info(f"Using current reference DPoDL checkpoint CID from registry: {current_ref_dpodl_checkpoint_cid_for_run}")
+    
+    # Ensure workers get None if CIDs are empty strings from contract for clarity
+    if isinstance(current_ref_model_state_cid_for_run, str) and not current_ref_model_state_cid_for_run:
+        current_ref_model_state_cid_for_run = None
+    if isinstance(current_ref_dpodl_checkpoint_cid_for_run, str) and not current_ref_dpodl_checkpoint_cid_for_run:
+        current_ref_dpodl_checkpoint_cid_for_run = None
 
     # --- Worker Configuration --- 
     train_loop_config = {
@@ -134,7 +154,8 @@ def run_training(
         "t1_threshold": app_config["t1_threshold"],
         "t2_threshold": app_config["t2_threshold"],
         "t_acc_threshold": app_config["t_acc_threshold"],
-        "reference_model_id": current_reference_model_id,
+        "reference_model_state_cid": current_ref_model_state_cid_for_run, # NEW KEY for model weights
+        "reference_dpodl_checkpoint_cid": current_ref_dpodl_checkpoint_cid_for_run, # NEW KEY for DPoDL proofs of reference
         "ipfs_enabled": app_config["ipfs_enabled"], # Pass IPFS enabled flag
         "model_override_params": app_config.get("model_override_params") # Pass model override
     }
@@ -175,7 +196,7 @@ def run_training(
     new_mtx_candidates = []
 
     # --- Process Metrics Dataframe for General Progress AND Submissions ---
-    if result.metrics_dataframe is not None and not result.metrics_dataframe.empty:
+            if result.metrics_dataframe is not None and not result.metrics_dataframe.empty:
         logger.info("Processing results from metrics_dataframe...")
         for index, report_data in result.metrics_dataframe.iterrows():
             worker_id_df = report_data.get("pid", report_data.get("hostname", f"worker_{report_data.get('trial_id', 'unknown')}"))
@@ -210,8 +231,8 @@ def run_training(
 
                 if epoch_num_df is not None: # Ensure it's a valid epoch report
                     logger.info(f"  Metrics DF (End of Epoch) - Worker [{worker_id_df}] Epoch [{epoch_num_df}]: Loss={loss_str}, Acc={acc_str}, Action={action_str}")
-    else:
-        logger.warning("No metrics dataframe found or it is empty.")
+            else:
+                 logger.warning("No metrics dataframe found or it is empty.")
 
     # Log findings from actual submissions (now populated from metrics_dataframe)
     if block_candidates:
@@ -234,10 +255,115 @@ def run_training(
     # logger.info(f"Current MTX Mempool size: {len(mtx_mempool)}") # If using mtx_mempool
     # --- End Processing Results --- 
 
+    # --- Process Pending MTXs from Blockchain Mempool (Phase 1, Step 2 & 3) ---
+    logger.info("--- Starting MTX Mempool Processing (Off-Chain Selection & Update) ---")
+    pending_mtxs_from_chain = fetch_pending_mtxs()
+    
+    evaluated_mtxs = []
+    if not pending_mtxs_from_chain:
+        logger.info("No pending MTXs found in the MTXMempool contract.")
+    else:
+        logger.info(f"Found {len(pending_mtxs_from_chain)} pending MTXs in contract. Evaluating...")
+        for mtx_data in pending_mtxs_from_chain:
+            logger.info(f"Processing MTX ID: {mtx_data['mtxId']}, Submitter: {mtx_data['submitter']}, Checkpoint CID: {mtx_data['ipfsCID']}")
+            dpodl_state_checkpoint = load_pickled_dict_from_ipfs(mtx_data['ipfsCID'], name=f"MTX_{mtx_data['mtxId']}_DPoDL_State")
+            if dpodl_state_checkpoint:
+                accuracy = dpodl_state_checkpoint.get("accuracy") # This is the float accuracy 0.0 to 1.0
+                if accuracy is not None:
+                    evaluated_mtxs.append({
+                        "mtxId": mtx_data['mtxId'],
+                        "ipfsCID": mtx_data['ipfsCID'],
+                        "submitter": mtx_data['submitter'],
+                        "accuracy": accuracy, # Storing the float accuracy
+                        "accuracyBPS_reported": mtx_data['accuracyBPS'], # Keep the originally reported one for comparison if needed
+                        "steps": mtx_data['steps'],
+                        "referenceModelCID": mtx_data['referenceModelCID']
+                    })
+                    logger.info(f"  Successfully evaluated MTX ID {mtx_data['mtxId']}. Fetched Accuracy: {accuracy:.4f}")
+                else:
+                    logger.warning(f"  Could not find 'accuracy' in DPoDL state for MTX ID {mtx_data['mtxId']}. Skipping.")
+            else:
+                logger.warning(f"  Failed to load DPoDL state from IPFS for MTX ID {mtx_data['mtxId']} (CID: {mtx_data['ipfsCID']}). Skipping.")
+
+    if evaluated_mtxs:
+        # Select best MTX (highest accuracy, then lowest mtxId for tie-breaking)
+        evaluated_mtxs.sort(key=lambda x: (-x['accuracy'], x['mtxId'])) # Sort by accuracy DESC, then mtxId ASC
+        best_mtx_candidate = evaluated_mtxs[0]
+        logger.info(f"Selected BEST MTX candidate from mempool: ID {best_mtx_candidate['mtxId']}, Submitter: {best_mtx_candidate['submitter']}, DPoDL Checkpoint CID: {best_mtx_candidate['ipfsCID']}, True Accuracy: {best_mtx_candidate['accuracy']:.4f}")
+        
+        # Phase 1, Step 3: Call ModelRegistry.sol to update the reference model
+        dpodl_checkpoint_cid_to_submit = best_mtx_candidate['ipfsCID']
+        mtx_id_to_submit = best_mtx_candidate['mtxId']
+
+        # Load the DPoDL state to get the actual model_state_cid submitted by the worker
+        dpodl_state_data = load_pickled_dict_from_ipfs(dpodl_checkpoint_cid_to_submit, name=f"MTX_{mtx_id_to_submit}_DPoDL_State_for_submission")
+        
+        model_state_cid_to_submit = None
+        if dpodl_state_data:
+            # The key for model_state_cid depends on what worker.py saves it as.
+            # Common keys might be: 'final_model_state_cid', 'model_state_cid', 'model_weights_cid'.
+            # Let's assume 'final_model_state_cid' based on prior discussions on worker outputs.
+            model_state_cid_to_submit = dpodl_state_data.get("final_model_state_cid") 
+            if not model_state_cid_to_submit:
+                # Fallback to other potential keys if the primary one is not found
+                model_state_cid_to_submit = dpodl_state_data.get("model_state_cid")
+            if not model_state_cid_to_submit:
+                 model_state_cid_to_submit = dpodl_state_data.get("model_checkpoint_cid") # If worker used this generic key for model state
+            
+            if model_state_cid_to_submit:
+                logger.info(f"Extracted Model State CID for submission: {model_state_cid_to_submit} from DPoDL Checkpoint {dpodl_checkpoint_cid_to_submit}")
+                
+                # --- DEBUGGING: Check mtxMempoolContract address in ModelRegistry ---
+                from . import blockchain_interface # Ensure module is loaded for direct call
+                try:
+                    logger.info("DEBUG: Querying ModelRegistry for its mtxMempoolContract address...")
+                    mempool_addr_in_registry = blockchain_interface.get_model_registry_mempool_address()
+                    logger.info(f"DEBUG: MTXMempool address set in ModelRegistry: {mempool_addr_in_registry}")
+                    # You might also want to log the expected address from your deployments
+                    # e.g., expected_mempool_address = blockchain_interface.get_mempool().address
+                    # logger.info(f"DEBUG: Expected MTXMempool address: {expected_mempool_address}")
+                    # if mempool_addr_in_registry != expected_mempool_address:
+                    #     logger.warning("DEBUG: Mismatch between expected and actual MTXMempool address in ModelRegistry!")
+                except Exception as e_debug_addr:
+                    logger.error(f"DEBUG: Error querying mtxMempoolContract address from ModelRegistry: {e_debug_addr}")
+                # --- END DEBUGGING ---
+
+                signer_private_key = os.getenv("REGISTRY_OPERATOR_PRIVATE_KEY")
+                if not signer_private_key:
+                    logger.error("REGISTRY_OPERATOR_PRIVATE_KEY not found in environment. Cannot submit MTX update to ModelRegistry.")
+                else:
+                    logger.info(f"Calling ModelRegistry to update with MTX ID {mtx_id_to_submit}, Model State CID {model_state_cid_to_submit}, DPoDL Checkpoint CID {dpodl_checkpoint_cid_to_submit}")
+                    update_receipt = update_reference_model_from_mtx(
+                        model_state_cid=model_state_cid_to_submit,
+                        dpodl_checkpoint_cid=dpodl_checkpoint_cid_to_submit,
+                        mtx_id=mtx_id_to_submit,
+                        signer_private_key=signer_private_key
+                    )
+
+                    if update_receipt and update_receipt.get("status") == 1:
+                        tx_hash = update_receipt.get("tx_hash")
+                        logger.info(f"Successfully updated ModelRegistry with MTX ID {mtx_id_to_submit}. TxHash: {tx_hash}")
+                        # Optionally, re-fetch and log the new global CIDs to confirm
+                        new_global_model_state = get_current_reference_model_state_cid()
+                        new_global_dpodl_checkpoint = get_current_reference_dpodl_checkpoint_cid()
+                        logger.info(f"New global reference model state CID: {new_global_model_state}, DPoDL checkpoint CID: {new_global_dpodl_checkpoint}")
+                    else:
+                        logger.error(f"Failed to update ModelRegistry with MTX ID {mtx_id_to_submit}. Receipt: {update_receipt}")
+            else:
+                logger.error(f"Could not find 'final_model_state_cid' (or similar) in DPoDL state for MTX ID {mtx_id_to_submit} (DPoDL CID: {dpodl_checkpoint_cid_to_submit}). Cannot update ModelRegistry.")
+        else:
+            logger.error(f"Failed to load DPoDL state from IPFS for MTX ID {mtx_id_to_submit} (DPoDL CID: {dpodl_checkpoint_cid_to_submit}). Cannot determine model_state_cid for submission.")
+
+    elif pending_mtxs_from_chain: # Some were pending but none could be evaluated
+        logger.info("No MTXs could be successfully evaluated from the pending list.")
+    else: # No pending and none evaluated (already covered by initial check)
+        pass 
+
+    logger.info("--- Finished MTX Mempool Processing ---")
+
     # In a real system, run_training would be called again, potentially
     # looping or triggered by new tasks/blocks. The select_best_mtx 
     # logic would run at the start of that next call.
-
 
 if __name__ == "__main__":
     logger.info("Running trainer script directly.")

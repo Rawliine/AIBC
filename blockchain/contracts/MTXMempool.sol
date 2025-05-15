@@ -11,6 +11,14 @@ import "@openzeppelin/contracts/access/Ownable.sol";
  */
 contract MTXMempool is Ownable {
 
+    // --- Enums ---
+    enum Status {
+        Pending,
+        SelectedForProcessing, // Marked by an off-chain process (or owner) as a candidate for ModelRegistry
+        Processed,             // Confirmed by ModelRegistry as having been used/referenced
+        Rejected               // Marked by an off-chain process (or owner) as not suitable
+    }
+
     // --- Structs ---
 
     /**
@@ -18,12 +26,13 @@ contract MTXMempool is Ownable {
      */
     struct ModelTransaction {
         uint256 mtxId;                // Unique ID for the MTX
-        string ipfsCID;               // IPFS CID of the model checkpoint file
+        string ipfsCID;               // IPFS CID of the model checkpoint file (containing DPoDL state)
         uint256 accuracyBPS;          // Accuracy in Basis Points (e.g., 8500 for 85.00%)
         uint256 steps;                // Training steps performed for this model
         string referenceModelCID;     // CID of the model this MTX was based on
         address submitter;            // Address that submitted this MTX
         uint256 timestamp;            // Timestamp when the MTX was submitted
+        Status status;                // Status of the MTX in its lifecycle
         bool isValid;                 // Flag to indicate if the MTX exists (used for mapping checks)
     }
 
@@ -31,6 +40,7 @@ contract MTXMempool is Ownable {
 
     mapping(uint256 => ModelTransaction) public mtxPool; // mtxId => ModelTransaction data
     uint256 public nextMtxId;                          // Counter for assigning unique IDs
+    address public modelRegistryContract;              // Address of the ModelRegistry contract
 
     // Optional: Add limits or cleanup mechanisms if needed (e.g., max size, TTL)
     // uint256 public maxMempoolSize = 1000;
@@ -47,19 +57,48 @@ contract MTXMempool is Ownable {
         uint256 accuracyBPS,
         string referenceModelCID,
         address indexed submitter,
-        uint256 timestamp
+        uint256 timestamp,
+        Status status // Added status
+    );
+
+    /**
+     * @dev Emitted when an MTX's status is updated.
+     */
+    event MtxStatusUpdated(
+        uint256 indexed mtxId,
+        address indexed updatedBy,
+        Status newStatus
     );
 
     // --- Errors ---
+
     // (Add specific errors if needed, e.g., MempoolFull)
     error InvalidMtxId(uint256 mtxId);
+    error InvalidStatusUpdate(Status currentStatus, Status newStatus);
+
+
+    // --- Modifiers ---
+    modifier onlyModelRegistryOrOwner() {
+        require(msg.sender == modelRegistryContract || msg.sender == owner(), "Caller is not ModelRegistry or owner");
+        _;
+    }
 
     // --- Constructor ---
+
     constructor(address _initialOwner) Ownable(_initialOwner) {
         nextMtxId = 1; // Start MTX IDs from 1
     }
 
     // --- Core Functions ---
+
+    /**
+     * @dev Sets the address of the ModelRegistry contract. Can only be called by the owner.
+     * @param _registryAddress The address of the ModelRegistry contract.
+     */
+    function setModelRegistryContract(address _registryAddress) public onlyOwner {
+        require(_registryAddress != address(0), "Invalid registry address");
+        modelRegistryContract = _registryAddress;
+    }
 
     /**
      * @dev Adds a new Model Transaction (MTX) to the mempool.
@@ -89,6 +128,7 @@ contract MTXMempool is Ownable {
             referenceModelCID: _referenceModelCID,
             submitter: msg.sender,
             timestamp: submissionTimestamp,
+            status: Status.Pending, // Initial status
             isValid: true
         });
 
@@ -100,11 +140,36 @@ contract MTXMempool is Ownable {
             _accuracyBPS,
             _referenceModelCID,
             msg.sender,
-            submissionTimestamp
+            submissionTimestamp,
+            Status.Pending // Emit initial status
         );
 
         // Optional: Implement mempool size management/cleanup logic here if needed
     }
+
+    /**
+     * @dev Updates the status of an existing MTX.
+     *      Can only be called by the ModelRegistry contract or the owner.
+     * @param _mtxId The ID of the MTX to update.
+     * @param _newStatus The new status for the MTX.
+     */
+    function updateMtxStatus(uint256 _mtxId, Status _newStatus) public onlyModelRegistryOrOwner {
+        ModelTransaction storage mtx = mtxPool[_mtxId];
+        if (!mtx.isValid) {
+            revert InvalidMtxId(_mtxId);
+        }
+
+        // Optional: Add logic to prevent invalid status transitions if needed
+        // For example, cannot go from Processed back to Pending directly
+        // if (_newStatus == Status.Pending && (mtx.status == Status.Processed || mtx.status == Status.SelectedForProcessing)) {
+        //     revert InvalidStatusUpdate(mtx.status, _newStatus);
+        // }
+
+        mtx.status = _newStatus;
+
+        emit MtxStatusUpdated(_mtxId, msg.sender, _newStatus);
+    }
+
 
     // --- View Functions ---
 
