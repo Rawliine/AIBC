@@ -7,6 +7,8 @@ import subprocess
 import json
 import ipfshttpclient
 from collections import OrderedDict # Import OrderedDict
+import logging.handlers # Make sure this is imported
+import sys # Import sys for stdout/stderr redirection
 
 # Use basicConfig only if no handlers are configured by caller (e.g., Ray)
 if not logging.getLogger().hasHandlers():
@@ -14,6 +16,128 @@ if not logging.getLogger().hasHandlers():
 
 # Use the root logger or a specific logger for this module
 logger = logging.getLogger("dpodl_core.utils") 
+
+# Global variable to store the original stdout and stderr
+original_stdout = sys.stdout
+original_stderr = sys.stderr
+
+class StreamToLogger:
+    """
+    Fake file-like stream object that redirects writes to a logger instance.
+    """
+    def __init__(self, logger_instance, log_level=logging.INFO, original_stream_for_fileno=None):
+        self.logger = logger_instance
+        self.log_level = log_level
+        self.linebuf = ''
+        self.original_stream_for_fileno = original_stream_for_fileno
+        # Try to get encoding from the original stream, default to utf-8
+        if self.original_stream_for_fileno and hasattr(self.original_stream_for_fileno, 'encoding'):
+            self.encoding = self.original_stream_for_fileno.encoding
+        else:
+            self.encoding = "utf-8" # Default encoding
+
+    def write(self, buf):
+        for line in buf.rstrip().split('\n'):
+            if line.strip():  # Only log non-empty lines
+                # Check if line looks like an error message
+                if any(error_indicator in line.lower() for error_indicator in ['error', 'exception', 'failed', 'critical', 'fatal']):
+                    self.logger.log(logging.ERROR, line.rstrip())
+                else:
+                    self.logger.log(self.log_level, line.rstrip())
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        if self.original_stream_for_fileno and hasattr(self.original_stream_for_fileno, 'isatty'):
+            return self.original_stream_for_fileno.isatty()
+        return False
+
+    def fileno(self):
+        if self.original_stream_for_fileno and hasattr(self.original_stream_for_fileno, 'fileno'):
+            return self.original_stream_for_fileno.fileno()
+        # Fallback if no original stream or it has no fileno.
+        # This might be problematic if a real fileno is strictly required.
+        # For faulthandler, it might need a real one.
+        # Raise an error as a non-functional fileno can cause subtle issues.
+        raise OSError(f"StreamToLogger (logger: {self.logger.name}, level: {self.log_level}) does not have a valid file descriptor.")
+
+
+def setup_main_file_logging(log_file_name="main_script.log", logs_dir="logs", max_files=4, max_bytes=10*1024*1024):
+    """
+    Sets up file logging for a main script, including rotating files and stdout/stderr redirection.
+    Args:
+        log_file_name (str): The base name for the log file (e.g., 'trainer.log').
+        logs_dir (str): The directory to store log files.
+        max_files (int): The maximum number of log files to keep.
+        max_bytes (int): The maximum size of a log file before rotation.
+    """
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+
+    log_file_path = os.path.join(logs_dir, log_file_name)
+
+    # Get the root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO) # Set a base level; can be overridden by specific handlers
+
+    # Remove existing handlers to avoid duplicate logs if this function is called multiple times
+    # for handler in root_logger.handlers[:]:
+    #     root_logger.removeHandler(handler)
+
+    # Configure RotatingFileHandler
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file_path,
+        maxBytes=max_bytes,
+        backupCount=max_files -1 if max_files > 0 else 0 # backupCount is N-1 files
+    )
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    # Redirect stdout and stderr to the logger
+    # It's important to ensure that the logger used by StreamToLogger is configured
+    # to write to the file. Using the root logger here ensures that.
+    # Pass the module-level original_stdout/stderr which should be the true console streams.
+    sys.stdout = StreamToLogger(root_logger, logging.INFO, original_stream_for_fileno=original_stdout)
+    sys.stderr = StreamToLogger(root_logger, logging.ERROR, original_stream_for_fileno=original_stderr)
+
+    root_logger.info(f"Logging initialized. Output is being redirected to {log_file_path}")
+    root_logger.info(f"Log rotation configured: max_files={max_files}, max_bytes={max_bytes}")
+
+
+def restore_original_streams():
+    """Restores sys.stdout and sys.stderr to their original values."""
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+    logging.getLogger().info("Restored original stdout and stderr streams.")
+
+
+def get_logger(name, log_file=None, level=logging.INFO, logs_dir="logs", max_files=4, max_bytes=10*1024*1024):
+    """
+    Returns a logger with the specified name and configuration.
+    If log_file is provided, it sets up file logging.
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    if log_file:
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir)
+
+        log_file_path = os.path.join(logs_dir, log_file)
+
+        # Configure RotatingFileHandler
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file_path,
+            maxBytes=max_bytes,
+            backupCount=max_files -1 if max_files > 0 else 0 # backupCount is N-1 files
+        )
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
 
 # --- Memory Logging --- #
 
