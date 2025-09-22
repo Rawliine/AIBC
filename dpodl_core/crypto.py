@@ -4,6 +4,9 @@ import struct
 import json
 from collections import OrderedDict
 import math # Added for Merkle tree padding
+from eth_account import Account
+from eth_account.messages import encode_typed_data
+import time
 
 # Configure logging for this module
 logger = logging.getLogger(__name__)
@@ -325,3 +328,192 @@ def verify_post_hash_threshold(post_hash_hex: str, t2_threshold: int) -> bool:
 def deterministic_json_dumps(data):
     """Serializes data to JSON string deterministically (sorted keys)."""
     return json.dumps(data, sort_keys=True)
+
+# --- SHA-256 File Hashing (for manifest validation) --- #
+
+def sha256_hash_bytes(data: bytes) -> bytes:
+    """Calculates SHA-256 hash of bytes and returns bytes (for file integrity checks)."""
+    return hashlib.sha256(data).digest()
+
+def sha256_hash_hex(data: bytes) -> str:
+    """Calculates SHA-256 hash of bytes and returns hex string."""
+    return hashlib.sha256(data).hexdigest()
+
+# --- EIP-712 Signature System --- #
+
+# EIP-712 Domain and Types for DPoDL Model Manifests
+DPODL_DOMAIN_NAME = "DPoDLManifest"
+DPODL_DOMAIN_VERSION = "1"
+
+def get_eip712_domain(chain_id: int, verifying_contract: str) -> dict:
+    """Constructs the EIP-712 domain separator for DPoDL manifests."""
+    return {
+        "name": DPODL_DOMAIN_NAME,
+        "version": DPODL_DOMAIN_VERSION,
+        "chainId": chain_id,
+        "verifyingContract": verifying_contract
+    }
+
+def get_eip712_manifest_types() -> dict:
+    """Defines the EIP-712 types for DPoDL model manifest signing."""
+    return {
+        "EIP712Domain": [
+            {"name": "name", "type": "string"},
+            {"name": "version", "type": "string"},
+            {"name": "chainId", "type": "uint256"},
+            {"name": "verifyingContract", "type": "address"}
+        ],
+        "Manifest": [
+            {"name": "modelCid", "type": "string"},
+            {"name": "checkpointCid", "type": "string"},
+            {"name": "manifestCid", "type": "string"},
+            {"name": "modelSha256", "type": "string"},
+            {"name": "checkpointSha256", "type": "string"},
+            {"name": "modelSize", "type": "uint256"},
+            {"name": "checkpointSize", "type": "uint256"},
+            {"name": "datasetHash", "type": "string"},
+            {"name": "steps", "type": "uint256"},
+            {"name": "accuracyBPS", "type": "uint256"},
+            {"name": "referenceDpodlCid", "type": "string"},
+            {"name": "submitter", "type": "address"},
+            {"name": "timestamp", "type": "uint256"},
+            {"name": "artifactVersion", "type": "string"}
+        ]
+    }
+
+def create_manifest_message(
+    model_cid: str,
+    checkpoint_cid: str,
+    manifest_cid: str,
+    model_sha256: str,
+    checkpoint_sha256: str,
+    model_size: int,
+    checkpoint_size: int,
+    dataset_hash: str,
+    steps: int,
+    accuracy_bps: int,
+    reference_dpodl_cid: str,
+    submitter_address: str,
+    timestamp: int = None,
+    artifact_version: str = "1.0"
+) -> dict:
+    """Creates the manifest message data for EIP-712 signing."""
+    if timestamp is None:
+        timestamp = int(time.time())
+    
+    return {
+        "modelCid": model_cid,
+        "checkpointCid": checkpoint_cid,
+        "manifestCid": manifest_cid,
+        "modelSha256": model_sha256,
+        "checkpointSha256": checkpoint_sha256,
+        "modelSize": model_size,
+        "checkpointSize": checkpoint_size,
+        "datasetHash": dataset_hash,
+        "steps": steps,
+        "accuracyBPS": accuracy_bps,
+        "referenceDpodlCid": reference_dpodl_cid,
+        "submitter": submitter_address,
+        "timestamp": timestamp,
+        "artifactVersion": artifact_version
+    }
+
+def sign_manifest_eip712(
+    manifest_data: dict,
+    chain_id: int,
+    verifying_contract: str,
+    private_key: str
+) -> tuple[str, dict]:
+    """
+    Signs a manifest using EIP-712.
+    
+    Args:
+        manifest_data: The manifest message data
+        chain_id: The blockchain chain ID
+        verifying_contract: The contract address for domain
+        private_key: The signer's private key (hex string with or without 0x)
+        
+    Returns:
+        tuple: (signature_hex, structured_data)
+    """
+    # Ensure private key has proper format
+    if not private_key.startswith('0x'):
+        private_key = '0x' + private_key
+    
+    domain = get_eip712_domain(chain_id, verifying_contract)
+    types = get_eip712_manifest_types()
+    
+    structured_data = {
+        "types": types,
+        "primaryType": "Manifest", 
+        "domain": domain,
+        "message": manifest_data
+    }
+    
+    # Encode and sign - pass the full structured data dict
+    encoded_data = encode_typed_data(full_message=structured_data)
+    signed_message = Account.sign_message(encoded_data, private_key)
+    
+    signature_hex = signed_message.signature.hex()
+    logger.debug(f"Created EIP-712 signature for manifest: {signature_hex[:10]}...")
+    
+    return signature_hex, structured_data
+
+def verify_manifest_signature(
+    signature_hex: str,
+    structured_data: dict,
+    expected_signer: str
+) -> bool:
+    """
+    Verifies an EIP-712 manifest signature.
+    
+    Args:
+        signature_hex: The signature to verify
+        structured_data: The structured data that was signed
+        expected_signer: The expected signer address
+        
+    Returns:
+        bool: True if signature is valid and from expected signer
+    """
+    try:
+        # Encode the structured data
+        encoded_data = encode_typed_data(full_message=structured_data)
+        
+        # Recover the signer address
+        recovered_address = Account.recover_message(encoded_data, signature=signature_hex)
+        
+        # Normalize addresses for comparison (checksummed)
+        recovered_address = Account.to_checksum_address(recovered_address)
+        expected_signer = Account.to_checksum_address(expected_signer)
+        
+        is_valid = recovered_address == expected_signer
+        
+        if is_valid:
+            logger.debug(f"EIP-712 signature verification successful. Signer: {recovered_address}")
+        else:
+            logger.warning(f"EIP-712 signature verification failed. Expected: {expected_signer}, Recovered: {recovered_address}")
+            
+        return is_valid
+        
+    except Exception as e:
+        logger.error(f"Error verifying EIP-712 signature: {e}")
+        return False
+
+def recover_manifest_signer(signature_hex: str, structured_data: dict) -> str | None:
+    """
+    Recovers the signer address from an EIP-712 manifest signature.
+    
+    Args:
+        signature_hex: The signature
+        structured_data: The structured data that was signed
+        
+    Returns:
+        str: The recovered signer address, or None if recovery fails
+    """
+    try:
+        encoded_data = encode_typed_data(full_message=structured_data)
+        recovered_address = Account.recover_message(encoded_data, signature=signature_hex)
+        return Account.to_checksum_address(recovered_address)
+    except Exception as e:
+        logger.error(f"Error recovering signer from EIP-712 signature: {e}")
+        return None

@@ -8,6 +8,15 @@ import json
 import requests # For Pinata API
 import asyncio # Add asyncio import
 from dpodl_core.blockchain_config import PinataConfig
+import safetensors.torch
+from typing import Dict, Any, Tuple, Optional
+from .crypto import (
+    sha256_hash_hex, 
+    create_manifest_message, 
+    sign_manifest_eip712, 
+    verify_manifest_signature,
+    recover_manifest_signer
+)
 
 from .blockchain_config import IPFS_HOST
 # Use a more specific logger if available, otherwise a default one
@@ -189,13 +198,18 @@ async def save_model_state_to_ipfs(model_state: dict, model_name: str) -> str | 
         return None
 
 def load_model_state_from_ipfs(cid: str, model_name: str) -> dict | None:
-    """Loads a model's state_dict from IPFS given a CID."""
+    """
+    DEPRECATED: Legacy unsafe model loading. Use load_secure_model_artifacts instead.
+    Loads a model's state_dict from IPFS given a CID with weights_only=True for safety.
+    """
+    logger.warning(f"Using deprecated unsafe model loading for {model_name}. Consider upgrading to secure format.")
     try:
         model_bytes = load_data_from_ipfs(cid)
         if model_bytes:
             buffer = io.BytesIO(model_bytes)
-            model_state = torch.load(buffer)
-            logger.info(f"Model '{model_name}' state_dict loaded from IPFS (CID: {cid})")
+            # Use weights_only=True to prevent arbitrary code execution
+            model_state = torch.load(buffer, weights_only=True)
+            logger.info(f"Model '{model_name}' state_dict loaded from IPFS (CID: {cid}) with weights_only=True")
             return model_state
         return None
     except Exception as e:
@@ -246,7 +260,11 @@ def load_checkpoint_data_from_ipfs(cid: str, name: str) -> dict | None:
         return None
 
 def load_pickled_dict_from_ipfs(cid: str, name: str = "dpodl_checkpoint_pickle") -> dict | None:
-    """Loads a pickled dictionary (like D-PoDL checkpoint state) from IPFS given a CID."""
+    """
+    DEPRECATED: Legacy unsafe pickle loading. Use load_secure_model_artifacts instead.
+    Loads a pickled dictionary (like D-PoDL checkpoint state) from IPFS given a CID.
+    """
+    logger.warning(f"Using deprecated unsafe pickle loading for {name}. Consider upgrading to secure format.")
     try:
         pickled_bytes = load_data_from_ipfs(cid)
         if pickled_bytes:
@@ -254,12 +272,18 @@ def load_pickled_dict_from_ipfs(cid: str, name: str = "dpodl_checkpoint_pickle")
             import io      # For BytesIO
             import torch   # For torch.load
             buffer = io.BytesIO(pickled_bytes)
-            # Use torch.load, as it can handle pickled Python objects and also
-            # PyTorch tensors, including those with persistent_id issues.
+            # Use torch.load with weights_only=True for safety (may fail with complex objects)
             # map_location can be useful if loading CUDA tensors on CPU.
-            data_dict = torch.load(buffer, map_location=torch.device('cpu'))
-            logger.info(f"Data '{name}' loaded and unpickled using torch.load from IPFS (CID: {cid})")
-            return data_dict
+            try:
+                data_dict = torch.load(buffer, map_location=torch.device('cpu'), weights_only=True)
+                logger.info(f"Data '{name}' loaded safely with weights_only=True from IPFS (CID: {cid})")
+                return data_dict
+            except Exception as weights_only_err:
+                logger.warning(f"weights_only=True failed for {name}, falling back to unsafe mode: {weights_only_err}")
+                buffer.seek(0)  # Reset buffer position
+                data_dict = torch.load(buffer, map_location=torch.device('cpu'))
+                logger.warning(f"Data '{name}' loaded using UNSAFE torch.load from IPFS (CID: {cid})")
+                return data_dict
         return None
     # torch.load can raise various errors, including pickle.UnpicklingError or RuntimeError
     except Exception as e: 
@@ -293,3 +317,412 @@ def merge_model_states(state_dicts: list[dict]) -> dict:
 
     logger.info("Merging complete.")
     return merged_state
+
+# --- Security Configuration --- #
+
+# File size limits (configurable)
+DEFAULT_MAX_MODEL_SIZE = 200 * 1024 * 1024  # 200MB default
+DEFAULT_MAX_CHECKPOINT_SIZE = 50 * 1024 * 1024  # 50MB default
+
+# Allowed tensor dtypes for security
+ALLOWED_DTYPES = {
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.int32,
+    torch.int64,
+    torch.int8,
+    torch.uint8,
+    torch.bool
+}
+
+# JSON schema for checkpoint metadata
+CHECKPOINT_SCHEMA_REQUIRED_FIELDS = {
+    "steps", "accuracy_bps", "dataset_hash", "reference_dpodl_cid", 
+    "model_hash", "merkle_root", "seed", "artifact_version"
+}
+
+# --- Secure Save Functions --- #
+
+async def save_secure_model_artifacts(
+    model_state_dict: Dict[str, torch.Tensor],
+    checkpoint_metadata: Dict[str, Any],
+    private_key: str,
+    submitter_address: str,
+    chain_id: int,
+    verifying_contract: str,
+    dataset_hash: str,
+    reference_dpodl_cid: str = "",
+    pin_to_pinata_flag: bool = True
+) -> Optional[Tuple[str, str, str]]:
+    """
+    Securely saves model artifacts as safetensors + signed manifest.
+    
+    Args:
+        model_state_dict: The model's state dictionary
+        checkpoint_metadata: Training metadata (steps, accuracy, etc.)
+        private_key: Private key for EIP-712 signing
+        submitter_address: The submitter's Ethereum address
+        chain_id: Blockchain chain ID
+        verifying_contract: Contract address for EIP-712 domain
+        dataset_hash: Hash of the dataset used for training
+        reference_dpodl_cid: Reference model's DPoDL checkpoint CID
+        pin_to_pinata_flag: Whether to pin to Pinata
+        
+    Returns:
+        tuple: (model_cid, checkpoint_cid, manifest_cid) or None if failed
+    """
+    try:
+        client = get_ipfs_client()
+        if not client:
+            logger.error("IPFS client not available for secure save")
+            return None
+
+        # Validate inputs
+        if not _validate_model_state_dict(model_state_dict):
+            logger.error("Model state dict validation failed")
+            return None
+            
+        if not _validate_checkpoint_metadata(checkpoint_metadata):
+            logger.error("Checkpoint metadata validation failed")
+            return None
+
+        # 1. Save model weights as safetensors
+        model_bytes = _serialize_safetensors(model_state_dict)
+        if len(model_bytes) > DEFAULT_MAX_MODEL_SIZE:
+            logger.error(f"Model size {len(model_bytes)} exceeds limit {DEFAULT_MAX_MODEL_SIZE}")
+            return None
+            
+        model_cid = client.add_bytes(model_bytes)
+        model_sha256 = sha256_hash_hex(model_bytes)
+        logger.info(f"Model safetensors saved to IPFS: {model_cid}")
+
+        # 2. Save checkpoint metadata as JSON
+        checkpoint_bytes = json.dumps(checkpoint_metadata, sort_keys=True).encode('utf-8')
+        if len(checkpoint_bytes) > DEFAULT_MAX_CHECKPOINT_SIZE:
+            logger.error(f"Checkpoint size {len(checkpoint_bytes)} exceeds limit {DEFAULT_MAX_CHECKPOINT_SIZE}")
+            return None
+            
+        checkpoint_cid = client.add_bytes(checkpoint_bytes)
+        checkpoint_sha256 = sha256_hash_hex(checkpoint_bytes)
+        logger.info(f"Checkpoint metadata saved to IPFS: {checkpoint_cid}")
+
+        # 3. Create and sign manifest
+        manifest_data = create_manifest_message(
+            model_cid=model_cid,
+            checkpoint_cid=checkpoint_cid,
+            manifest_cid="",  # Will be filled after we get the CID
+            model_sha256=model_sha256,
+            checkpoint_sha256=checkpoint_sha256,
+            model_size=len(model_bytes),
+            checkpoint_size=len(checkpoint_bytes),
+            dataset_hash=dataset_hash,
+            steps=checkpoint_metadata["steps"],
+            accuracy_bps=checkpoint_metadata["accuracy_bps"],
+            reference_dpodl_cid=reference_dpodl_cid,
+            submitter_address=submitter_address,
+            artifact_version=checkpoint_metadata.get("artifact_version", "1.0")
+        )
+
+        # First, save manifest without signature to get CID
+        temp_manifest = {
+            "format_version": "1.0",
+            "files": {
+                "model.safetensors": {
+                    "cid": model_cid,
+                    "sha256": model_sha256,
+                    "size": len(model_bytes)
+                },
+                "checkpoint.json": {
+                    "cid": checkpoint_cid,
+                    "sha256": checkpoint_sha256,
+                    "size": len(checkpoint_bytes)
+                }
+            },
+            "metadata": manifest_data,
+            "signature": None,  # Will be filled
+            "structured_data": None  # Will be filled
+        }
+
+        # Create temporary manifest to get its CID
+        temp_manifest_bytes = json.dumps(temp_manifest, sort_keys=True).encode('utf-8')
+        temp_manifest_cid = client.add_bytes(temp_manifest_bytes)
+        
+        # Update manifest data with actual CID
+        manifest_data["manifestCid"] = temp_manifest_cid
+
+        # Sign the complete manifest
+        signature_hex, structured_data = sign_manifest_eip712(
+            manifest_data, chain_id, verifying_contract, private_key
+        )
+
+        # Create final manifest with signature
+        final_manifest = {
+            "format_version": "1.0",
+            "files": {
+                "model.safetensors": {
+                    "cid": model_cid,
+                    "sha256": model_sha256,
+                    "size": len(model_bytes)
+                },
+                "checkpoint.json": {
+                    "cid": checkpoint_cid,
+                    "sha256": checkpoint_sha256,
+                    "size": len(checkpoint_bytes)
+                }
+            },
+            "metadata": manifest_data,
+            "signature": signature_hex,
+            "structured_data": structured_data
+        }
+
+        # Save final signed manifest
+        final_manifest_bytes = json.dumps(final_manifest, sort_keys=True).encode('utf-8')
+        manifest_cid = client.add_bytes(final_manifest_bytes)
+        logger.info(f"Signed manifest saved to IPFS: {manifest_cid}")
+
+        # Pin to Pinata if requested
+        if pin_to_pinata_flag:
+            await pin_to_pinata(model_cid, f"model_{model_cid[:12]}")
+            await pin_to_pinata(checkpoint_cid, f"checkpoint_{checkpoint_cid[:12]}")
+            await pin_to_pinata(manifest_cid, f"manifest_{manifest_cid[:12]}")
+
+        return model_cid, checkpoint_cid, manifest_cid
+
+    except Exception as e:
+        logger.error(f"Error in secure model save: {e}", exc_info=True)
+        return None
+
+# --- Secure Load Functions --- #
+
+def load_secure_model_artifacts(
+    manifest_cid: str,
+    expected_submitter: str = None,
+    load_weights: bool = True,
+    max_model_size: int = DEFAULT_MAX_MODEL_SIZE,
+    max_checkpoint_size: int = DEFAULT_MAX_CHECKPOINT_SIZE
+) -> Optional[Dict[str, Any]]:
+    """
+    Securely loads and validates model artifacts.
+    
+    Args:
+        manifest_cid: The manifest CID to load
+        expected_submitter: Expected submitter address (None to skip check)
+        load_weights: Whether to load the actual model weights
+        max_model_size: Maximum allowed model size
+        max_checkpoint_size: Maximum allowed checkpoint size
+        
+    Returns:
+        dict: {
+            'model_state_dict': torch.state_dict (if load_weights=True),
+            'checkpoint_metadata': dict,
+            'manifest': dict,
+            'is_valid': bool,
+            'validation_errors': list
+        }
+    """
+    validation_errors = []
+    result = {
+        'model_state_dict': None,
+        'checkpoint_metadata': None,
+        'manifest': None,
+        'is_valid': False,
+        'validation_errors': validation_errors
+    }
+
+    try:
+        client = get_ipfs_client()
+        if not client:
+            validation_errors.append("IPFS client not available")
+            return result
+
+        # 1. Load and parse manifest
+        manifest_bytes = load_data_from_ipfs(manifest_cid)
+        if not manifest_bytes:
+            validation_errors.append("Failed to load manifest from IPFS")
+            return result
+
+        try:
+            manifest = json.loads(manifest_bytes.decode('utf-8'))
+        except json.JSONDecodeError as e:
+            validation_errors.append(f"Invalid manifest JSON: {e}")
+            return result
+
+        result['manifest'] = manifest
+
+        # 2. Validate manifest structure
+        if not _validate_manifest_structure(manifest):
+            validation_errors.append("Invalid manifest structure")
+            return result
+
+        # 3. Verify EIP-712 signature if expected_submitter provided
+        if expected_submitter:
+            signature = manifest.get('signature')
+            structured_data = manifest.get('structured_data')
+            
+            if not signature or not structured_data:
+                validation_errors.append("Missing signature or structured data")
+                return result
+
+            if not verify_manifest_signature(signature, structured_data, expected_submitter):
+                # Also try recovering to see who actually signed
+                actual_signer = recover_manifest_signer(signature, structured_data)
+                validation_errors.append(f"Signature verification failed. Expected: {expected_submitter}, Actual: {actual_signer}")
+                return result
+
+        # 4. Load and validate checkpoint metadata
+        checkpoint_cid = manifest['files']['checkpoint.json']['cid']
+        checkpoint_bytes = load_data_from_ipfs(checkpoint_cid)
+        if not checkpoint_bytes:
+            validation_errors.append("Failed to load checkpoint from IPFS")
+            return result
+
+        # Validate checkpoint size
+        if len(checkpoint_bytes) > max_checkpoint_size:
+            validation_errors.append(f"Checkpoint size {len(checkpoint_bytes)} exceeds limit {max_checkpoint_size}")
+            return result
+
+        # Validate checkpoint hash
+        expected_checkpoint_hash = manifest['files']['checkpoint.json']['sha256']
+        actual_checkpoint_hash = sha256_hash_hex(checkpoint_bytes)
+        if actual_checkpoint_hash != expected_checkpoint_hash:
+            validation_errors.append("Checkpoint hash mismatch")
+            return result
+
+        try:
+            checkpoint_metadata = json.loads(checkpoint_bytes.decode('utf-8'))
+        except json.JSONDecodeError as e:
+            validation_errors.append(f"Invalid checkpoint JSON: {e}")
+            return result
+
+        if not _validate_checkpoint_metadata(checkpoint_metadata):
+            validation_errors.append("Invalid checkpoint metadata")
+            return result
+
+        result['checkpoint_metadata'] = checkpoint_metadata
+
+        # 5. Load and validate model weights (if requested)
+        if load_weights:
+            model_cid = manifest['files']['model.safetensors']['cid']
+            model_bytes = load_data_from_ipfs(model_cid)
+            if not model_bytes:
+                validation_errors.append("Failed to load model from IPFS")
+                return result
+
+            # Validate model size
+            if len(model_bytes) > max_model_size:
+                validation_errors.append(f"Model size {len(model_bytes)} exceeds limit {max_model_size}")
+                return result
+
+            # Validate model hash
+            expected_model_hash = manifest['files']['model.safetensors']['sha256']
+            actual_model_hash = sha256_hash_hex(model_bytes)
+            if actual_model_hash != expected_model_hash:
+                validation_errors.append("Model hash mismatch")
+                return result
+
+            # Load safetensors
+            try:
+                from safetensors.torch import load
+                model_state_dict = load(model_bytes)
+            except Exception as e:
+                validation_errors.append(f"Failed to load safetensors: {e}")
+                return result
+
+            # Validate tensor dtypes
+            if not _validate_model_state_dict(model_state_dict):
+                validation_errors.append("Model state dict validation failed")
+                return result
+
+            result['model_state_dict'] = model_state_dict
+
+        # If we get here, everything is valid
+        result['is_valid'] = True
+        logger.info(f"Successfully loaded and validated secure model artifacts from {manifest_cid}")
+
+    except Exception as e:
+        validation_errors.append(f"Unexpected error: {e}")
+        logger.error(f"Error in secure model load: {e}", exc_info=True)
+
+    return result
+
+# --- Helper Functions --- #
+
+def _serialize_safetensors(state_dict: Dict[str, torch.Tensor]) -> bytes:
+    """Serialize a state dict to safetensors format."""
+    # Use safetensors.torch.save_file with a BytesIO buffer
+    from safetensors.torch import save
+    buffer = io.BytesIO()
+    # safetensors expects the buffer to be passed directly, not as a file-like object
+    tensor_bytes = save(state_dict)
+    return tensor_bytes
+
+def _validate_model_state_dict(state_dict: Dict[str, torch.Tensor]) -> bool:
+    """Validate that a model state dict contains only allowed tensor types."""
+    try:
+        for key, tensor in state_dict.items():
+            if not isinstance(tensor, torch.Tensor):
+                logger.error(f"Non-tensor value found in state dict: {key}")
+                return False
+            
+            if tensor.dtype not in ALLOWED_DTYPES:
+                logger.error(f"Disallowed dtype {tensor.dtype} for tensor {key}")
+                return False
+                
+            # Additional size checks
+            if tensor.numel() > 1e9:  # > 1B parameters per tensor
+                logger.error(f"Tensor {key} too large: {tensor.numel()} elements")
+                return False
+                
+        return True
+    except Exception as e:
+        logger.error(f"Error validating state dict: {e}")
+        return False
+
+def _validate_checkpoint_metadata(metadata: Dict[str, Any]) -> bool:
+    """Validate checkpoint metadata has required fields."""
+    try:
+        missing_fields = CHECKPOINT_SCHEMA_REQUIRED_FIELDS - set(metadata.keys())
+        if missing_fields:
+            logger.error(f"Missing required fields in checkpoint: {missing_fields}")
+            return False
+            
+        # Type checks
+        if not isinstance(metadata.get("steps"), int) or metadata["steps"] < 0:
+            logger.error("Invalid steps value")
+            return False
+            
+        if not isinstance(metadata.get("accuracy_bps"), int) or not (0 <= metadata["accuracy_bps"] <= 10000):
+            logger.error("Invalid accuracy_bps value")
+            return False
+            
+        return True
+    except Exception as e:
+        logger.error(f"Error validating checkpoint metadata: {e}")
+        return False
+
+def _validate_manifest_structure(manifest: Dict[str, Any]) -> bool:
+    """Validate that manifest has the expected structure."""
+    try:
+        required_keys = {'format_version', 'files', 'metadata'}
+        if not all(key in manifest for key in required_keys):
+            logger.error("Missing required keys in manifest")
+            return False
+            
+        files = manifest.get('files', {})
+        required_files = {'model.safetensors', 'checkpoint.json'}
+        if not all(file in files for file in required_files):
+            logger.error("Missing required files in manifest")
+            return False
+            
+        # Check each file has required fields
+        for filename, file_info in files.items():
+            required_file_keys = {'cid', 'sha256', 'size'}
+            if not all(key in file_info for key in required_file_keys):
+                logger.error(f"Missing required fields for file {filename}")
+                return False
+                
+        return True
+    except Exception as e:
+        logger.error(f"Error validating manifest structure: {e}")
+        return False

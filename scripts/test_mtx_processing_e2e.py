@@ -4,10 +4,11 @@ import os
 import time
 import logging
 import sys
+from web3 import Web3 # Added for direct Web3 usage if any
 
 # Adjust path to import from dpodl_core
 # This might need adjustment based on how you run the script (e.g., from root or from scripts/ folder)
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..')) # Restoring this line
 
 from dpodl_core.blockchain_interface import (
     initialize_blockchain_connection,
@@ -15,12 +16,23 @@ from dpodl_core.blockchain_interface import (
     get_current_reference_dpodl_checkpoint_cid,
     submit_mtx,
     get_mtx_details, # To verify status later
-    get_token, # To check balances
-    get_w3 # Added to get web3 instance for account derivation
+    get_token, # To check balances, and now to get the contract instance
+    get_w3, # Changed from get_web3_instance
+    update_mtx_status,
+    update_reference_model_from_mtx,
+    get_model_registry_mempool_address,
+    fetch_pending_mtxs, # Changed from get_all_pending_mtxs to actual function name
 )
-from dpodl_core.ipfs_utils import save_checkpoint_data_to_ipfs, get_ipfs_client # Using save_checkpoint_data_to_ipfs for pickled dict
-from dpodl_core.config_utils import get_config
+from dpodl_core.ipfs_utils import (
+    get_ipfs_client, # Added this import
+    save_model_state_to_ipfs, 
+    save_checkpoint_data_to_ipfs, # Changed from save_pickled_dict_to_ipfs
+    load_pickled_dict_from_ipfs, load_model_state_from_ipfs
+)
+from dpodl_core.config_utils import get_config # Keep get_config
 from dpodl_core.trainer import run_training # We will call the trainer's main orchestration function
+from dpodl_core.utils import get_logger, setup_main_file_logging, restore_original_streams # Removed load_config
+from dpodl_core.blockchain_config import PinataConfig, get_contract_info # Import get_contract_info
 
 # Configure logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -32,235 +44,280 @@ logger = logging.getLogger("test_mtx_e2e")
 # REGISTRY_OPERATOR_PRIVATE_KEY: Private key of the ModelRegistry owner/operator
 # These should be pre-funded with gas on your local Hardhat node.
 
-def main():
-    logger.info("Starting E2E test for MTX Processing and Rewards...")
+# Configure basic logging for the script itself
+# This logger will write to the console as usual, unless setup_main_file_logging is called
+script_logger = get_logger(__name__) # Module-specific logger
 
-    # Initialize blockchain and IPFS (ensure IPFS daemon is running)
-    initialize_blockchain_connection()
-    ipfs_client = get_ipfs_client()
-    if not ipfs_client:
-        logger.error("IPFS client not available. Exiting.")
-        return
+# --- Configuration & Setup ---
+CONFIG = get_config() # Use get_config from config_utils
 
-    app_config = get_config() # Load environment specific config (dev/test)
+# Fetch contract addresses using get_contract_info
+mempool_address, _ = get_contract_info("MTXMempool")
+registry_address, _ = get_contract_info("ModelRegistry")
+token_address, _ = get_contract_info("DPoDLToken")
 
-    worker_private_key = os.getenv("TEST_WORKER_PRIVATE_KEY")
-    registry_operator_private_key = os.getenv("REGISTRY_OPERATOR_PRIVATE_KEY")
+if not mempool_address or not registry_address or not token_address:
+    script_logger.error("Failed to retrieve one or more contract addresses. Exiting.")
+    # Consider exiting more gracefully or raising an exception
+    sys.exit(1) # Exit if critical configuration is missing
 
-    if not worker_private_key:
-        logger.error("TEST_WORKER_PRIVATE_KEY not set in environment. Cannot submit MTX.")
-        return
-    if not registry_operator_private_key:
-        logger.error("REGISTRY_OPERATOR_PRIVATE_KEY not set in environment. Trainer won't be able to update registry.")
-        # Note: trainer.py itself fetches this, so this check is more for awareness here.
-        # The test will proceed, and trainer.py will log the error if it can't find its key.
+MTX_MEMPOOL_CONTRACT_ADDRESS = mempool_address
+MODEL_REGISTRY_CONTRACT_ADDRESS = registry_address
+DPODL_TOKEN_CONTRACT_ADDRESS = token_address
 
-    # 1. Get Initial Reference Model State CID (base for the MTX)
-    logger.info("Fetching initial reference model state CID from ModelRegistry...")
-    initial_ref_model_state_cid = get_current_reference_model_state_cid()
-    if not initial_ref_model_state_cid:
-        logger.warning("Initial reference model state CID is empty/None. This might be okay for absolute genesis.")
-        # If it's truly the first run, this CID might be the one set in constructor (e.g. placeholder)
-        # For the submit_mtx call, if it's empty, we might need to pass an empty string or a defined genesis CID.
-        # The MTXMempool's submitMtx expects a referenceModelCID.
-        # Let's assume ModelRegistry's getCurrentReferenceModelStateCID returns a non-empty string after deployment (from constructor arg)
-        if not initial_ref_model_state_cid: # if still None after warning (e.g. contract returned empty string which get_fn converted to None)
-             initial_ref_model_state_cid = "Qm__ABSOLUTE_GENESIS_STATE_CID_FOR_MTX_REFERENCE__" # Fallback for safety if contract allows empty
-             logger.info(f"Using fallback absolute genesis CID for MTX reference: {initial_ref_model_state_cid}")
+REGISTRY_OPERATOR_PRIVATE_KEY = os.getenv("REGISTRY_OPERATOR_PRIVATE_KEY")
+if not REGISTRY_OPERATOR_PRIVATE_KEY:
+    script_logger.warning("REGISTRY_OPERATOR_PRIVATE_KEY is not set in .env. Registry updates will fail.")
 
+# Account that will submit the MTX (e.g., a worker)
+# Use one of the worker keys for testing submission
+SUBMITTER_PRIVATE_KEY = os.getenv("WORKER_PRIVATE_KEY_0", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80") 
+SUBMITTER_ADDRESS = Web3().eth.account.from_key(SUBMITTER_PRIVATE_KEY).address
 
-    logger.info(f"Initial reference model state CID: {initial_ref_model_state_cid}")
+# Account that will be rewarded (can be same as submitter or different)
+REWARD_ADDRESS = SUBMITTER_ADDRESS 
 
-    # 2. Prepare and Submit an MTX from a simulated worker
-    logger.info("Preparing dummy DPoDL checkpoint data for MTX...")
-    dummy_model_state_cid_for_mtx = f"QmModelForMTX_{int(time.time())}"
-    dpodl_state_for_mtx = {
-        "final_model_state_cid": dummy_model_state_cid_for_mtx,
-        "accuracy": 0.8876,  # True accuracy (float)
-        "steps_trained_locally": 150,
-        "reference_model_state_cid_used": initial_ref_model_state_cid,
-        # Add other relevant D-PoDL proof data as expected by your system
+async def create_dummy_dpodl_checkpoint_and_upload(steps_completed=100, accuracy_val=0.75):
+    """Creates a dummy D-PoDL checkpoint dict and uploads its components to IPFS."""
+    script_logger.info("Creating and uploading dummy D-PoDL checkpoint to IPFS...")
+    
+    # 1. Dummy Model State (e.g., a simple dictionary)
+    dummy_model_state = {"layer1.weights": [0.1, 0.2], "epoch": 1, "architecture": "dummy_transformer_small"}
+    # save_model_state_to_ipfs is also async, so it needs to be awaited
+    model_state_cid = await save_model_state_to_ipfs(dummy_model_state, model_name="dummy_model_state_for_mtx")
+    if not model_state_cid:
+        script_logger.error("Failed to upload dummy model state to IPFS.")
+        return None, None
+    script_logger.info(f"Dummy model state uploaded to IPFS. CID: {model_state_cid}")
+
+    # 2. Dummy D-PoDL State (dictionary with proofs, hashes, etc.)
+    dummy_dpodl_state = {
+        "prev_block_hash": "0x" + "a"*64,
+        "nonce": 12345,
+        "pre_hash_value": "0x" + "b"*64,
+        "reference_model_id": "QmReferenceModelStateCIDPreviouslyUsedByWorker", # Could be None if from genesis
+        "random_seed": 78910,
+        "seed_for_weights": 78910, # Often same as random_seed or derived
+        "t1_threshold": CONFIG["t1_threshold"], 
+        "t2_threshold": CONFIG["t2_threshold"],
+        "accuracy": accuracy_val, # This is the crucial field for selection!
+        "t_acc_threshold": CONFIG["t_acc_threshold"],
+        "final_model_state_hash": "0x" + "c"*64, # Hash of the model state
+        "final_model_state_cid": model_state_cid, # CID of the actual model state (weights, etc.) <--- IMPORTANT FOR REGISTRY
+        "post_hash_value": "0x" + "d"*64,
+        "steps_at_checkpoint": steps_completed,
+        "merkle_root": "0x" + "e"*64,
+        "checkpoint_hashes": ["0x"+"f"*10 for _ in range(5)], # List of intermediate hashes
+        "trace_hash": "0x" + "g"*64,
+        "trace_file_path": "/tmp/dummy_trace.jsonl" # Path on worker, not directly used by blockchain
     }
+    # Use the correct function name and await it
+    dpodl_checkpoint_cid = await save_checkpoint_data_to_ipfs(dummy_dpodl_state, name="dummy_dpodl_chkpt_for_mtx")
+    if not dpodl_checkpoint_cid:
+        script_logger.error("Failed to upload dummy D-PoDL checkpoint state to IPFS.")
+        return None, None # Or handle error appropriately
+    script_logger.info(f"Dummy D-PoDL checkpoint state uploaded to IPFS. CID: {dpodl_checkpoint_cid}")
+
+    return model_state_cid, dpodl_checkpoint_cid
+
+async def main(): # Make main async
+    # Setup file logging for stdout/stderr at the very beginning
+    setup_main_file_logging(log_file_name="test_mtx_processing_e2e.log", logs_dir="logs/e2e_test_runs")
+    script_logger.info("======== STARTING E2E MTX PROCESSING TEST ========")
     
-    # Save this DPoDL state to IPFS (as a pickled dictionary)
-    # save_checkpoint_data_to_ipfs is async, but blockchain_interface is sync.
-    # For this test script, let's manage the event loop if direct async call is needed,
-    # or use a sync wrapper if ipfs_utils provides one.
-    # Current save_checkpoint_data_to_ipfs in ipfs_utils is async.
-    # Let's assume we have a sync version or handle it:
-    
-    # Hacky way to run async from sync for this test script, replace with proper async handling if utils are all async
-    import asyncio
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    dpodl_checkpoint_cid_for_mtx = loop.run_until_complete(
-        save_checkpoint_data_to_ipfs(dpodl_state_for_mtx, name=f"E2E_Test_MTX_DPoDL_State")
-    )
-
-    if not dpodl_checkpoint_cid_for_mtx:
-        logger.error("Failed to save DPoDL state to IPFS for MTX. Aborting.")
-        return
-    logger.info(f"Dummy DPoDL state for MTX saved to IPFS. DPoDL Checkpoint CID: {dpodl_checkpoint_cid_for_mtx}")
-
-    # accuracy_bps for MTX submission (self-reported by worker)
-    reported_accuracy_bps = int(dpodl_state_for_mtx["accuracy"] * 10000) 
-    reported_steps = dpodl_state_for_mtx["steps_trained_locally"]
-
-    logger.info(f"Submitting MTX to mempool: DPoDL_CID={dpodl_checkpoint_cid_for_mtx}, AccBPS={reported_accuracy_bps}, Steps={reported_steps}, RefStateCID={initial_ref_model_state_cid}")
-    
-    submission_result = submit_mtx(
-        ipfs_cid=dpodl_checkpoint_cid_for_mtx, # This is the DPoDL checkpoint CID for the MTX
-        accuracy_bps=reported_accuracy_bps,
-        steps=reported_steps,
-        reference_cid=initial_ref_model_state_cid, # The model state it was based on
-        signer_private_key=worker_private_key
-    )
-
-    if not submission_result or not submission_result.get("receipt") or submission_result["receipt"].get("status") != 1:
-        logger.error(f"Failed to submit MTX. Result: {submission_result}")
-        return
-    
-    submit_receipt = submission_result["receipt"]
-    submitted_mtx_id_for_check = submission_result.get("mtxId")
-
-    logger.info(f"MTX submitted successfully! TxHash: {submit_receipt.transactionHash.hex()}. Parsed MTX ID: {submitted_mtx_id_for_check}")
-    
-    if submitted_mtx_id_for_check is None:
-        logger.warning("submit_mtx did not return an mtxId. Verification of status by ID will be skipped. Please check MtxSubmitted event parsing.")
-
-    # It might take a moment for the event/MTX to be fully indexed by the trainer's next call
-    logger.info("Waiting a few seconds for MTX to propagate if needed...")
-    time.sleep(5) # Adjust as necessary for your local node
-
-    # 3. Run the Trainer Orchestration
-    # The trainer will fetch pending MTXs, select the best, and call ModelRegistry
-    logger.info("Running D-PoDL training orchestration (which includes MTX processing)...")
-    # Ensure DPODL_ENV is set to your test environment if trainer.py relies on it
-    # For this E2E test, we assume the trainer will pick up the REGISTRY_OPERATOR_PRIVATE_KEY from its env
-    
-    # The run_training function might run for multiple epochs based on config.
-    # For E2E of MTX processing, we need it to complete its MTX selection phase.
-    # If `run_training` is very long, we might need a more targeted function from trainer
-    # or adjust its config for a quick run for this test.
-    # For now, assume `run_training` from `test` profile is fast enough.
-    try:
-        run_training() # cli_num_workers can be passed if needed
-    except Exception as e:
-        logger.error(f"Error during run_training: {e}", exc_info=True)
-        # Even if training part fails, MTX processing might have occurred if it's at the end.
-        # We will proceed to check status.
-
-    logger.info("Trainer orchestration finished (or an attempt was made).")
-
-    # 4. Verification
-    logger.info("--- Verifying MTX Processing Results ---")
-    
-    selected_mtx_id_by_trainer = 1 
-    # DPoDL Checkpoint CID for MTX 1 (from trainer logs): QmZQBd1bkwTTTb5mogobjoibVn94AzwxmzQ1THonGahrSs
-    # Model State CID for MTX 1 (from trainer logs, extracted from its DPoDL checkpoint): QmModelForMTX_1747271946
-    expected_model_cid_after_update = "QmModelForMTX_1747271946" 
-    expected_dpodl_cid_after_update = "QmZQBd1bkwTTTb5mogobjoibVn94AzwxmzQ1THonGahrSs"
-    submitter_of_selected_mtx = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" # Submitter of MTX 1
-
-    # Check status of the MTX selected by the trainer
-    logger.info(f"Checking status of MTX ID {selected_mtx_id_by_trainer} (selected by trainer for update)")
-    mtx_info_selected = get_mtx_details(selected_mtx_id_by_trainer)
-    if mtx_info_selected:
-        logger.info(f"MTX {selected_mtx_id_by_trainer} details after trainer run: {mtx_info_selected}")
-        if mtx_info_selected.get("status_str") == "Processed":
-            logger.info(f"SUCCESS: MTX ID {selected_mtx_id_by_trainer} status is Processed as expected.")
-        else:
-            logger.error(f"FAILURE: MTX ID {selected_mtx_id_by_trainer} status is {mtx_info_selected.get('status_str')}, expected Processed.")
-            all_checks_pass = False
-    else:
-        logger.error(f"FAILURE: Could not retrieve details for MTX ID {selected_mtx_id_by_trainer}.")
-        all_checks_pass = False
-
-
-    # Also check the status of the MTX originally submitted by this E2E script (if it's different)
-    if submission_result and "mtxId" in submission_result and submission_result["mtxId"] is not None:
-        submitted_mtx_id_by_script = submission_result["mtxId"]
-        if submitted_mtx_id_by_script != selected_mtx_id_by_trainer:
-            logger.info(f"Checking status of MTX ID {submitted_mtx_id_by_script} (submitted by E2E script)")
-            mtx_info_script_submitted = get_mtx_details(submitted_mtx_id_by_script)
-            if mtx_info_script_submitted:
-                logger.info(f"MTX {submitted_mtx_id_by_script} details after trainer run: {mtx_info_script_submitted}")
-                # This MTX might be Pending or Rejected if another was chosen. Not a strict failure if not Processed.
-                logger.info(f"Status of E2E-submitted MTX ID {submitted_mtx_id_by_script}: {mtx_info_script_submitted.get('status_str')}")
-            else:
-                logger.warning(f"Could not retrieve details for E2E-submitted MTX ID {submitted_mtx_id_by_script}.")
-    else:
-        logger.warning("Could not determine the MTX ID submitted by the E2E script for status check.")
-
-
-    logger.info("Verifying global model CIDs in ModelRegistry...")
-    final_global_model_cid = get_current_reference_model_state_cid()
-    final_global_dpodl_cid = get_current_reference_dpodl_checkpoint_cid()
-    logger.info(f"Final global model state CID: {final_global_model_cid}")
-    logger.info(f"Final global DPoDL checkpoint CID: {final_global_dpodl_cid}")
-
-    if final_global_model_cid == expected_model_cid_after_update:
-        logger.info(f"SUCCESS: Global model state CID is {final_global_model_cid} as expected.")
-    else:
-        logger.error(f"FAILURE: Global model state CID is {final_global_model_cid}, expected {expected_model_cid_after_update}.")
-        cid_update_failed = True
-        all_checks_pass = False
-
-    if final_global_dpodl_cid == expected_dpodl_cid_after_update:
-        logger.info(f"SUCCESS: Global DPoDL checkpoint CID is {final_global_dpodl_cid} as expected.")
-    else:
-        logger.error(f"FAILURE: Global DPoDL checkpoint CID is {final_global_dpodl_cid}, expected {expected_dpodl_cid_after_update}.")
-        cid_update_failed = True
-        all_checks_pass = False
-
-    logger.info("--- Verifying MTX Submitter Token Balance ---")
-    
-    # Verify reward for the submitter of the *selected* MTX
-    logger.info(f"Checking token balance for selected MTX submitter: {submitter_of_selected_mtx}")
-    initial_reward_amount_str = os.getenv("INITIAL_MTX_REWARD_AMOUNT", "50000000000000000000") # 50 DPDL
-    expected_reward_wei = int(initial_reward_amount_str)
-    logger.info(f"Expected reward for MTX (in Wei, from config): {expected_reward_wei}")
-
-    # The current ModelRegistry doesn't reward genesis submission, only updates from MTX.
-    token_contract_instance = get_token()
-    if not token_contract_instance:
-        logger.error("DPoDLToken contract instance not available. Cannot check balance.")
-        all_checks_pass = False
-    else:
-        submitter_balance_wei = token_contract_instance.functions.balanceOf(submitter_of_selected_mtx).call()
-        logger.info(f"Selected MTX Submitter ({submitter_of_selected_mtx}) DPoDLToken balance (Wei): {submitter_balance_wei}")
-
-        # This check assumes the submitter might have other tokens or received other rewards.
-        # A truly accurate check would require knowing the balance *before* this specific reward.
-        # For simplicity, we check if the balance is at least the reward amount.
-        if submitter_balance_wei >= expected_reward_wei: # Simplistic check
-            logger.info(f"SUCCESS: Selected MTX Submitter token balance ({submitter_balance_wei} Wei) is sufficient to cover the expected reward ({expected_reward_wei} Wei).")
-        else:
-            logger.error(f"FAILURE: Selected MTX Submitter token balance ({submitter_balance_wei} Wei) is less than the expected reward ({expected_reward_wei} Wei).")
-            all_checks_pass = False
+        script_logger.info("Connecting to blockchain and IPFS...")
+        # The blockchain_interface module initializes connection on import.
+        # We just need to get the w3 instance.
+        web3_instance = get_w3() 
+        ipfs_client = get_ipfs_client() # Ensure get_ipfs_client is imported
         
-    # Log the original submitter's balance too if different for completeness
-    if worker_private_key:
-        from eth_account import Account
-        worker_address = Account.from_key(worker_private_key).address
-        if worker_address.lower() != submitter_of_selected_mtx.lower():
-            if not token_contract_instance:
-                logger.error("DPoDLToken contract instance not available. Cannot check E2E script submitter balance.")
-                # all_checks_pass might already be False from above
+        if not web3_instance or not web3_instance.is_connected():
+            script_logger.error("Failed to connect to blockchain or get Web3 instance. Exiting test.")
+            # Ensure ipfs_client is also checked if it can be None or has a similar check
+            if not ipfs_client: # This is fine as a secondary log if web3 fails anyway
+                 script_logger.error("IPFS client also appears to be unavailable.")
+            return
+        
+        if not ipfs_client: # Explicitly check if ipfs_client failed to initialize
+            script_logger.error("Failed to get IPFS client. Exiting test.")
+            return # This return should be INSIDE the if block
+            
+        script_logger.info("Successfully connected to blockchain and IPFS.")
+
+        # Contracts are loaded by initialize_blockchain_connection() within the blockchain_interface module.
+        # So, no explicit load_contracts() call is needed here.
+        # load_contracts(web3_instance) # Removed this line
+
+        script_logger.info("Smart contracts should be loaded automatically by blockchain_interface.")
+        script_logger.info(f"  MTXMempool Contract Address: {MTX_MEMPOOL_CONTRACT_ADDRESS}")
+        script_logger.info(f"  ModelRegistry Contract Address: {MODEL_REGISTRY_CONTRACT_ADDRESS}")
+        script_logger.info(f"  DPoDLToken Contract Address: {DPODL_TOKEN_CONTRACT_ADDRESS}")
+        script_logger.info(f"  Submitter (Worker) Address: {SUBMITTER_ADDRESS}")
+        script_logger.info(f"  Reward Address: {REWARD_ADDRESS}")
+        script_logger.info(f"  Pinata Pinning Enabled: {PinataConfig.ENABLE_PINNING}")
+
+        script_logger.info("--- Step 1: Simulating Worker MTX Submission ---")
+        # Await the async function call
+        _dummy_model_cid_low_acc, dpodl_cid_low_acc = await create_dummy_dpodl_checkpoint_and_upload(steps_completed=100, accuracy_val=0.70)
+        _dummy_model_cid_high_acc, dpodl_cid_high_acc = await create_dummy_dpodl_checkpoint_and_upload(steps_completed=120, accuracy_val=0.85)
+        
+        if not dpodl_cid_low_acc or not dpodl_cid_high_acc:
+            script_logger.error("Failed to create and upload one or both dummy D-PoDL checkpoints. Exiting.")
+            return
+
+        ref_model_cid_for_mtx = get_current_reference_model_state_cid()
+        if not ref_model_cid_for_mtx:
+            ref_model_cid_for_mtx = "Qm__GENESIS_OR_SOME_PREVIOUS_MODEL_STATE__"
+            script_logger.info(f"ModelRegistry is at genesis or empty. Using placeholder reference model CID for MTX: {ref_model_cid_for_mtx}")
+        else:
+            script_logger.info(f"Using reference model CID from ModelRegistry for MTX: {ref_model_cid_for_mtx}")
+
+        script_logger.info(f"Submitting MTX with low accuracy (0.70) and DPoDL CID: {dpodl_cid_low_acc}")
+        tx_receipt_low = submit_mtx(
+            ipfs_cid=dpodl_cid_low_acc,
+            accuracy_bps=7000,
+            steps=100,
+            reference_cid=ref_model_cid_for_mtx,
+            signer_private_key=SUBMITTER_PRIVATE_KEY
+        )
+        if tx_receipt_low and tx_receipt_low.get("status") == 1 and tx_receipt_low.get("mtxId") is not None:
+            mtx_id_low = tx_receipt_low["mtxId"]
+            script_logger.info(f"Low accuracy MTX submitted successfully! MTX ID: {mtx_id_low}, TxHash: {tx_receipt_low['tx_hash']}")
+        else:
+            script_logger.error(f"Failed to submit low accuracy MTX or parse ID. Receipt: {tx_receipt_low}")
+            return # Exit if the first MTX submission fails
+    
+        script_logger.info(f"Submitting MTX with high accuracy (0.85) and DPoDL CID: {dpodl_cid_high_acc}")
+        tx_receipt_high = submit_mtx(
+            ipfs_cid=dpodl_cid_high_acc,
+            accuracy_bps=8500,
+            steps=120,
+            reference_cid=ref_model_cid_for_mtx,
+            signer_private_key=SUBMITTER_PRIVATE_KEY
+        )
+        if tx_receipt_high and tx_receipt_high.get("status") == 1 and tx_receipt_high.get("mtxId") is not None:
+            mtx_id_high = tx_receipt_high["mtxId"]
+            script_logger.info(f"High accuracy MTX submitted successfully! MTX ID: {mtx_id_high}, TxHash: {tx_receipt_high['tx_hash']}")
+        else:
+            script_logger.error(f"Failed to submit high accuracy MTX or parse ID. Receipt: {tx_receipt_high}")
+            return # Exit if the second MTX submission fails
+        
+        script_logger.info("Waiting a bit for blockchain state to settle...")
+        time.sleep(3)
+
+        # Store details of the MTXs we expect the trainer to process
+        expected_high_acc_mtx_id = mtx_id_high
+        expected_high_acc_dpodl_cid = dpodl_cid_high_acc
+        # This is the CID of the model state *within* the DPoDL checkpoint
+        expected_high_acc_model_state_cid_in_dpodl = _dummy_model_cid_high_acc 
+        
+        script_logger.info(f"--- Expected MTX to be processed by trainer: ID {expected_high_acc_mtx_id}, DPoDL CID {expected_high_acc_dpodl_cid}, Inner Model CID {expected_high_acc_model_state_cid_in_dpodl} ---")
+
+        # --- Step 2: Call Trainer's run_training to orchestrate MTX processing ---
+        script_logger.info("Calling dpodl_core.trainer.run_training() to process submitted MTXs...")
+        
+        # Get token balance BEFORE trainer run (for reward check)
+        token_contract_instance = get_token()
+        balance_before_trainer_run = 0
+        if token_contract_instance:
+            try:
+                balance_before_trainer_run = token_contract_instance.functions.balanceOf(REWARD_ADDRESS).call()
+                script_logger.info(f"DPDL Token balance of reward address ({REWARD_ADDRESS}) BEFORE trainer run: {Web3.from_wei(balance_before_trainer_run, 'ether')} DPDL")
+            except Exception as e_balance_before:
+                script_logger.error(f"Error fetching token balance before trainer run for {REWARD_ADDRESS}: {e_balance_before}")
+                token_contract_instance = None # Invalidate if error occurs
+
+        # Ensure REGISTRY_OPERATOR_PRIVATE_KEY is available for the trainer, as it will need it
+        if not REGISTRY_OPERATOR_PRIVATE_KEY:
+            script_logger.warning("REGISTRY_OPERATOR_PRIVATE_KEY is not set. The trainer (run_training) might fail to update ModelRegistry or MTX status.")
+        
+        # The trainer's run_training function will:
+        # 1. Fetch pending MTXs (including those we just submitted).
+        # 2. Evaluate them (load their DPoDL state from IPFS).
+        # 3. Select the best one (should be our high_accuracy_mtx).
+        # 4. Update its status to SelectedForProcessing.
+        # 5. Update the ModelRegistry with its details, rewarding the submitter.
+        try:
+            run_training() # No cli_num_workers override, will use config
+            script_logger.info("dpodl_core.trainer.run_training() completed.")
+        except Exception as e_trainer:
+            script_logger.error(f"Error during dpodl_core.trainer.run_training(): {e_trainer}", exc_info=True)
+            # We might still want to try and verify some states if the trainer partially ran
+            # or just exit if it's a critical failure. For now, we'll proceed to verification.
+
+        script_logger.info("--- Step 3: Verification after Trainer's Orchestration ---")
+
+        # 1. Verify Status of the Expected High Accuracy MTX
+        script_logger.info(f"Verifying status of the expected high-accuracy MTX (ID: {expected_high_acc_mtx_id})...")
+        mtx_details_after_trainer = get_mtx_details(expected_high_acc_mtx_id)
+        if mtx_details_after_trainer:
+            script_logger.info(f"  MTX ID {expected_high_acc_mtx_id} details post-trainer: {mtx_details_after_trainer}")
+            if mtx_details_after_trainer.get("status_str") == "Processed":
+                script_logger.info(f"  SUCCESS: MTX ID {expected_high_acc_mtx_id} status is 'Processed'.")
             else:
-                original_submitter_balance_wei = token_contract_instance.functions.balanceOf(worker_address).call()
-                logger.info(f"E2E Script's MTX Submitter ({worker_address}) DPoDLToken balance (Wei): {original_submitter_balance_wei}")
+                script_logger.error(f"  FAILURE: MTX ID {expected_high_acc_mtx_id} status is '{mtx_details_after_trainer.get('status_str')}', expected 'Processed'.")
+        else:
+            script_logger.error(f"  FAILURE: Could not fetch details for MTX ID {expected_high_acc_mtx_id} after trainer run.")
 
+        # 2. Verify ModelRegistry CIDs
+        script_logger.info("Verifying CIDs in ModelRegistry...")
+        final_global_model_cid = get_current_reference_model_state_cid()
+        final_global_dpodl_cid = get_current_reference_dpodl_checkpoint_cid()
+        script_logger.info(f"  ModelRegistry - Final Model State CID: {final_global_model_cid}")
+        script_logger.info(f"  ModelRegistry - Final DPoDL Checkpoint CID: {final_global_dpodl_cid}")
 
-    logger.info("E2E test for MTX Processing finished.")
-    if not all_checks_pass:
-        logger.error("One or more checks FAILED.")
-    else:
-        logger.info("All checks PASSED.")
+        if final_global_model_cid == expected_high_acc_model_state_cid_in_dpodl:
+            script_logger.info(f"  SUCCESS: ModelRegistry Model State CID matches expected: {expected_high_acc_model_state_cid_in_dpodl}.")
+        else:
+            script_logger.error(f"  FAILURE: ModelRegistry Model State CID is {final_global_model_cid}, expected {expected_high_acc_model_state_cid_in_dpodl}.")
+        
+        if final_global_dpodl_cid == expected_high_acc_dpodl_cid:
+            script_logger.info(f"  SUCCESS: ModelRegistry DPoDL Checkpoint CID matches expected: {expected_high_acc_dpodl_cid}.")
+        else:
+            script_logger.error(f"  FAILURE: ModelRegistry DPoDL Checkpoint CID is {final_global_dpodl_cid}, expected {expected_high_acc_dpodl_cid}.")
+
+        # 3. Verify Token Reward
+        if token_contract_instance: # Only check if instance was valid
+            script_logger.info(f"Verifying token reward for submitter ({REWARD_ADDRESS})...")
+            balance_after_trainer_run = token_contract_instance.functions.balanceOf(REWARD_ADDRESS).call()
+            script_logger.info(f"  DPDL Token balance of reward address ({REWARD_ADDRESS}) AFTER trainer run: {Web3.from_wei(balance_after_trainer_run, 'ether')} DPDL")
+            
+            # The exact reward amount might come from ModelRegistry's `initialMtxRewardAmount`
+            # For now, just check if balance increased.
+            if balance_after_trainer_run > balance_before_trainer_run:
+                increase_amount = Web3.from_wei(balance_after_trainer_run - balance_before_trainer_run, 'ether')
+                script_logger.info(f"  SUCCESS: Reward address received tokens! Balance increased by {increase_amount} DPDL.")
+            else:
+                script_logger.error(f"  FAILURE: Reward address balance did not increase. Before: {Web3.from_wei(balance_before_trainer_run, 'ether')}, After: {Web3.from_wei(balance_after_trainer_run, 'ether')}.")
+        else:
+            script_logger.warning("Skipping token reward verification as DPoDLToken contract instance was not available or failed earlier.")
+
+        # Verification for the low-accuracy MTX (optional, should ideally be 'Pending' or 'Rejected' by trainer logic if not selected)
+        if 'mtx_id_low' in locals():
+            script_logger.info(f"Verifying status of the low-accuracy MTX (ID: {mtx_id_low})...")
+            low_mtx_details_after_trainer = get_mtx_details(mtx_id_low)
+            if low_mtx_details_after_trainer:
+                status_str = low_mtx_details_after_trainer.get('status_str', 'Unknown')
+                script_logger.info(f"  Low-accuracy MTX ID {mtx_id_low} status post-trainer: {status_str}")
+                # Trainer *might* mark it as Rejected, or leave it Pending if only one MTX is processed per run.
+                # This check might need refinement based on trainer's exact logic for non-selected MTXs.
+                if status_str == "Pending" or status_str == "Rejected":
+                     script_logger.info(f"  INFO: Low-accuracy MTX ID {mtx_id_low} has an expected status ({status_str}).")
+                else:
+                     script_logger.warning(f"  WARNING: Low-accuracy MTX ID {mtx_id_low} has status '{status_str}'. This might be okay or indicate an issue depending on trainer's non-selection logic.")
+            else:
+                script_logger.warning(f"  Could not fetch details for low-accuracy MTX ID {mtx_id_low} after trainer run.")
+
+        script_logger.info("======== E2E MTX PROCESSING TEST COMPLETED (Trainer-Driven) ========")
+
+    except Exception as e:
+        script_logger.error(f"An uncaught error occurred during the E2E test: {e}", exc_info=True)
+    finally:
+        # Restore original stdout and stderr before exiting
+        restore_original_streams()
+        script_logger.info("Restored original stdout/stderr streams. E2E test script finished.")
 
 if __name__ == "__main__":
-    main() 
+    import asyncio # Import asyncio here
+    asyncio.run(main()) # Run the async main function 

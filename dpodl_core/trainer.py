@@ -25,7 +25,7 @@ from .blockchain_interface import (
     # Add the new debug function import here if it makes sense, or call it directly
     # For now, assume it will be added to blockchain_interface and called
 )
-from .config_utils import get_config # Import the new config utility
+from .config_utils import get_config, enhance_config_with_security # Import the new config utility
 from .ipfs_utils import load_pickled_dict_from_ipfs # Added for MTX processing
 
 # Configure logging if not already done globally
@@ -142,6 +142,10 @@ def run_training(
             current_ref_dpodl_checkpoint_cid_for_run = None
 
         # --- Worker Configuration --- 
+        # Get security configuration (we'll use worker 0 settings as default for all workers for now)
+        # In a production setup, you might want to distribute different keys to different workers
+        base_security_config = enhance_config_with_security(app_config, worker_id=0)
+        
         train_loop_config = {
             # Data/Model params
             "train_partitions": train_partitions, 
@@ -163,7 +167,12 @@ def run_training(
             "reference_model_state_cid": current_ref_model_state_cid_for_run, # NEW KEY for model weights
             "reference_dpodl_checkpoint_cid": current_ref_dpodl_checkpoint_cid_for_run, # NEW KEY for DPoDL proofs of reference
             "ipfs_enabled": app_config["ipfs_enabled"], # Pass IPFS enabled flag
-            "model_override_params": app_config.get("model_override_params") # Pass model override
+            "model_override_params": app_config.get("model_override_params"), # Pass model override
+            # Security configuration for secure model loading
+            "worker_private_key": base_security_config.get("worker_private_key"),
+            "worker_address": base_security_config.get("worker_address"),
+            "dataset_hash": base_security_config.get("dataset_hash"),
+            "secure_loading_enabled": base_security_config.get("secure_loading_enabled", False)
         }
         # logger.info(f"Worker config prepared: {train_loop_config}") # Logged later if needed
 

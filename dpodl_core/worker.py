@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from collections import OrderedDict # Added for checkpoint hashes
 from hashlib import sha256
 from web3 import Web3
+import logging.handlers # Import RotatingFileHandler
 
 # Import necessary components from the package
 from .models import DeeperTransformer
@@ -30,7 +31,9 @@ from .ipfs_utils import (
     save_model_state_to_ipfs,
     save_checkpoint_data_to_ipfs, # Added import
     load_checkpoint_data_from_ipfs, # Added import
-    pin_to_pinata # Keep pin_to_pinata import if needed elsewhere, otherwise remove
+    pin_to_pinata, # Keep pin_to_pinata import if needed elsewhere, otherwise remove
+    save_secure_model_artifacts,  # New secure save function
+    load_secure_model_artifacts   # New secure load function
 )
 # Import crypto functions
 from .crypto import (
@@ -47,6 +50,7 @@ from .crypto import (
 )
 # Import blockchain interface functions
 from .blockchain_interface import submit_block, submit_mtx # Removed unused imports
+from .blockchain_config import CHAIN_ID, get_contract_info
 # Import verification functions
 from .verification import verify_proof_of_training_consistency, load_and_verify_checkpoint_state
 # crypto and ipfs_utils might be needed later
@@ -93,6 +97,109 @@ def evaluate_accuracy(model, val_dataset, batch_size, device, seq_len, collate_f
     model.train() # Set model back to training mode
     return accuracy
 
+# --- Secure Checkpoint Save Helper --- #
+
+async def save_secure_checkpoint(
+    model_state_dict,
+    dpodl_state,
+    private_key,
+    submitter_address,
+    dataset_hash,
+    reference_dpodl_cid=""
+):
+    """
+    Saves model checkpoint using the new secure format with safetensors + EIP-712 signatures.
+    
+    Args:
+        model_state_dict: The model's state dictionary
+        dpodl_state: The DPoDL checkpoint state
+        private_key: Private key for signing
+        submitter_address: The submitter's address
+        dataset_hash: Hash of the training dataset
+        reference_dpodl_cid: Reference model's DPoDL checkpoint CID
+        
+    Returns:
+        tuple: (model_cid, checkpoint_cid, manifest_cid) or (None, None, None) if failed
+    """
+    try:
+        # Get contract address for EIP-712 domain
+        registry_address, _ = get_contract_info("ModelRegistry")
+        if not registry_address:
+            global_logger.error("Cannot get ModelRegistry address for secure save")
+            return None, None, None
+            
+        # Prepare checkpoint metadata in expected format
+        checkpoint_metadata = {
+            "steps": dpodl_state.get("steps_at_checkpoint", 0),
+            "accuracy_bps": int(dpodl_state.get("accuracy", 0.0) * 10000),
+            "dataset_hash": dataset_hash,
+            "reference_dpodl_cid": reference_dpodl_cid,
+            "model_hash": bytes_to_hex(hash_model_state(model_state_dict)),
+            "merkle_root": dpodl_state.get("merkle_root", ""),
+            "seed": dpodl_state.get("seed", 0),
+            "artifact_version": "1.0",
+            # Include other DPoDL state fields
+            "pre_hash": dpodl_state.get("pre_hash", ""),
+            "post_hash_value": dpodl_state.get("post_hash_value", ""),
+            "nonce": dpodl_state.get("nonce", 0),
+            "training_trace": dpodl_state.get("training_trace", [])
+        }
+        
+        # Save using secure format
+        result = await save_secure_model_artifacts(
+            model_state_dict=model_state_dict,
+            checkpoint_metadata=checkpoint_metadata,
+            private_key=private_key,
+            submitter_address=submitter_address,
+            chain_id=CHAIN_ID,
+            verifying_contract=registry_address,
+            dataset_hash=dataset_hash,
+            reference_dpodl_cid=reference_dpodl_cid,
+            pin_to_pinata_flag=True
+        )
+        
+        if result:
+            model_cid, checkpoint_cid, manifest_cid = result
+            global_logger.info(f"Secure checkpoint saved: model={model_cid}, checkpoint={checkpoint_cid}, manifest={manifest_cid}")
+            return model_cid, checkpoint_cid, manifest_cid
+        else:
+            global_logger.error("Secure checkpoint save failed")
+            return None, None, None
+            
+    except Exception as e:
+        global_logger.error(f"Error in secure checkpoint save: {e}", exc_info=True)
+        return None, None, None
+
+def load_secure_reference_model(manifest_cid, expected_submitter=None):
+    """
+    Securely loads a reference model using the new validation system.
+    
+    Args:
+        manifest_cid: The manifest CID to load
+        expected_submitter: Expected submitter address for verification
+        
+    Returns:
+        dict: model state dict or None if failed/invalid
+    """
+    try:
+        result = load_secure_model_artifacts(
+            manifest_cid=manifest_cid,
+            expected_submitter=expected_submitter,
+            load_weights=True
+        )
+        
+        if result and result.get('is_valid'):
+            global_logger.info(f"Successfully loaded and validated reference model from {manifest_cid}")
+            return result.get('model_state_dict')
+        else:
+            errors = result.get('validation_errors', ['Unknown error']) if result else ['Load failed']
+            global_logger.error(f"Reference model validation failed: {errors}")
+            return None
+            
+    except Exception as e:
+        global_logger.error(f"Error loading secure reference model: {e}", exc_info=True)
+        return None
+
 # --- Main Worker Loop --- #
 
 def worker_train_loop(config):
@@ -108,13 +215,26 @@ def worker_train_loop(config):
     # ===>>> Worker Logging Setup <<<===
     rank = get_context().get_world_rank()
     worker_logger = logging.getLogger(f"Worker_{rank}")
-    if not worker_logger.hasHandlers():
-         handler = logging.StreamHandler()
-         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-         handler.setFormatter(formatter)
-         worker_logger.addHandler(handler)
-         worker_logger.setLevel(logging.INFO)
-    worker_logger.info("--- worker_train_loop started! ---")
+    
+    # Clear existing handlers to avoid duplicate logging if re-running in same process (e.g. tests)
+    if worker_logger.hasHandlers():
+        worker_logger.handlers.clear()
+
+    # Configure RotatingFileHandler
+    log_file_name = f"worker_{rank}.log"
+    # Max 5MB per file, 3 backup files (total 4 files: worker_X.log, worker_X.log.1, worker_X.log.2, worker_X.log.3)
+    file_handler = logging.handlers.RotatingFileHandler(log_file_name, maxBytes=5*1024*1024, backupCount=3)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    worker_logger.addHandler(file_handler)
+    
+    # Optional: Keep StreamHandler for console output if needed (e.g., for Ray dashboard or quick checks)
+    # stream_handler = logging.StreamHandler()
+    # stream_handler.setFormatter(formatter)
+    # worker_logger.addHandler(stream_handler)
+    
+    worker_logger.setLevel(logging.INFO)
+    worker_logger.info("--- worker_train_loop started! Logging to file and possibly console. ---")
 
     # ===>>> Configuration Extraction <<<===
     world_size = get_context().get_world_size()
@@ -241,7 +361,14 @@ def worker_train_loop(config):
             reference_model_state = None
             reference_model_id = None # Ensure it's cleared if not loadable
         else:
-            reference_model_state = load_model_state_from_ipfs(reference_model_id, "reference_model")
+            # Try secure loading first, then fallback to legacy
+            worker_logger.info(f"Attempting to load reference model {reference_model_id} using secure validation...")
+            reference_model_state = load_secure_reference_model(reference_model_id)
+            
+            if reference_model_state is None:
+                worker_logger.warning("Secure loading failed, falling back to legacy loading...")
+                reference_model_state = load_model_state_from_ipfs(reference_model_id, "reference_model")
+                
             # --- Added Failure Check --- 
             if reference_model_state is None:
                 worker_logger.error(f"CRITICAL: Failed to load reference model {reference_model_id} from IPFS. Continuing without reference weights.")
@@ -516,7 +643,7 @@ def worker_train_loop(config):
                     't2_threshold': t2_threshold,
                     'accuracy': accuracy, # Ensure accuracy is saved
                     't_acc_threshold': t_acc_threshold, # Save threshold used for decision
-                    'final_model_state_hash': final_model_state_hash_hex, # Save hex
+                    'final_model_state_hash': final_model_state_hash_hex, # Save hex for verification
                     'post_hash_value': post_hash_value,
                     'steps_at_checkpoint': current_total_steps,
                     'merkle_root': merkle_root_hex, # Save hex representation
@@ -563,13 +690,41 @@ def worker_train_loop(config):
                             checkpoint_data_cid_for_tx = f"DUMMY_DATA_CID_BLOCK_{current_dpodl_state['steps_at_checkpoint']}"
                         else:
                             try:
-                                final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_block_{current_dpodl_state['steps_at_checkpoint']}"))
-                                checkpoint_data_cid_for_tx = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_block_{current_dpodl_state['steps_at_checkpoint']}"))
+                                # Use secure save for block submissions
+                                private_key = config.get("worker_private_key")
+                                submitter_address = config.get("worker_address")
+                                dataset_hash = config.get("dataset_hash", "default_dataset_hash")
+                                reference_dpodl_cid = current_dpodl_state.get('reference_model_id', "")
+                                
+                                if private_key and submitter_address:
+                                    result = asyncio.run(save_secure_checkpoint(
+                                        model.state_dict(),
+                                        current_dpodl_state,
+                                        private_key,
+                                        submitter_address,
+                                        dataset_hash,
+                                        reference_dpodl_cid
+                                    ))
+                                    if result:
+                                        model_cid, checkpoint_cid, manifest_cid = result
+                                        final_model_cid_for_tx = model_cid
+                                        checkpoint_data_cid_for_tx = manifest_cid  # Use manifest CID for DPoDL checkpoint
+                                        worker_logger.info(f"Secure block checkpoint saved: model={model_cid}, manifest={manifest_cid}")
+                                    else:
+                                        worker_logger.error("Secure checkpoint save failed, falling back to legacy")
+                                        final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_block_{current_dpodl_state['steps_at_checkpoint']}"))
+                                        checkpoint_data_cid_for_tx = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_block_{current_dpodl_state['steps_at_checkpoint']}"))
+                                else:
+                                    worker_logger.warning("Missing worker private key or address, falling back to legacy save")
+                                    final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_block_{current_dpodl_state['steps_at_checkpoint']}"))
+                                    checkpoint_data_cid_for_tx = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_block_{current_dpodl_state['steps_at_checkpoint']}"))
                             except Exception as ipfs_err:
                                  worker_logger.error(f"Error saving data to IPFS before block submission: {ipfs_err}", exc_info=True)
 
                         if final_model_cid_for_tx and checkpoint_data_cid_for_tx:
                             worker_logger.info(f"IPFS Save Complete: Model CID: {final_model_cid_for_tx}, Checkpoint Data CID: {checkpoint_data_cid_for_tx}")
+                            # Add final_model_state_cid to DPoDL state for trainer compatibility
+                            current_dpodl_state['final_model_state_cid'] = final_model_cid_for_tx
                             submitted_model_cid_for_record = final_model_cid_for_tx # Capture for submission record
                             # Submit to blockchain
                             try:
@@ -611,8 +766,34 @@ def worker_train_loop(config):
                             # checkpoint_data_cid_for_tx will be set after current_dpodl_state is formed.
                         else:
                             try:
-                                # Save the model state to IPFS and get its CID
-                                final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
+                                # Use secure save for MTX submissions
+                                private_key = config.get("worker_private_key")
+                                submitter_address = config.get("worker_address")
+                                dataset_hash = config.get("dataset_hash", "default_dataset_hash")
+                                reference_dpodl_cid = current_dpodl_state.get('reference_model_id', "")
+                                
+                                if private_key and submitter_address:
+                                    result = asyncio.run(save_secure_checkpoint(
+                                        model.state_dict(),
+                                        current_dpodl_state,
+                                        private_key,
+                                        submitter_address,
+                                        dataset_hash,
+                                        reference_dpodl_cid
+                                    ))
+                                    if result:
+                                        model_cid, checkpoint_cid, manifest_cid = result
+                                        final_model_cid_for_tx = model_cid
+                                        # Store manifest CID for later use
+                                        current_dpodl_state['secure_manifest_cid'] = manifest_cid
+                                        worker_logger.info(f"Secure MTX checkpoint saved: model={model_cid}, manifest={manifest_cid}")
+                                    else:
+                                        worker_logger.error("Secure MTX checkpoint save failed, falling back to legacy")
+                                        final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
+                                        current_dpodl_state['secure_manifest_cid'] = None
+                                else:
+                                    worker_logger.warning("Missing worker private key or address, falling back to legacy save")
+                                    final_model_cid_for_tx = asyncio.run(save_model_state_to_ipfs(model.state_dict(), f"final_model_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
                             except Exception as ipfs_err:
                                  worker_logger.error(f"Error saving model state to IPFS before MTX submission: {ipfs_err}", exc_info=True)
                                  # If model save fails, we can't proceed with this MTX submission.
@@ -625,6 +806,7 @@ def worker_train_loop(config):
                         # For now, assume current_dpodl_state is already defined and we're adding to it.
                         if final_model_cid_for_tx: # Only add if model CID was successfully obtained
                             current_dpodl_state['model_weights_ipfs_cid'] = final_model_cid_for_tx
+                            current_dpodl_state['final_model_state_cid'] = final_model_cid_for_tx  # Add for trainer compatibility
                         else:
                             worker_logger.error("CRITICAL: final_model_cid_for_tx is None. Cannot include model_weights_ipfs_cid in DPoDL state. MTX submission will likely fail or be incomplete.")
                             # To prevent submitting an MTX that points to a DPoDL state without the model CID:
@@ -635,8 +817,13 @@ def worker_train_loop(config):
                         if action == "SAVE_MTX_CHECKPOINT":
                             if ipfs_enabled and final_model_cid_for_tx: # Only proceed if model was saved and IPFS is on
                                 try:
-                                    # Save the (now updated) DPoDL state to IPFS and get its CID
-                                    checkpoint_data_cid_for_tx = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
+                                    # Use the manifest CID if we have it from secure save
+                                    if 'secure_manifest_cid' in current_dpodl_state and current_dpodl_state['secure_manifest_cid']:
+                                        checkpoint_data_cid_for_tx = current_dpodl_state['secure_manifest_cid']
+                                        worker_logger.info(f"Using secure manifest CID for MTX: {checkpoint_data_cid_for_tx}")
+                                    else:
+                                        # Fallback to legacy save
+                                        checkpoint_data_cid_for_tx = asyncio.run(save_checkpoint_data_to_ipfs(current_dpodl_state, f"checkpoint_data_mtx_{current_dpodl_state['steps_at_checkpoint']}"))
                                 except Exception as ipfs_err:
                                     worker_logger.error(f"Error saving DPoDL state (checkpoint_data) to IPFS for MTX: {ipfs_err}", exc_info=True)
                                     checkpoint_data_cid_for_tx = None # Ensure it's None if save fails

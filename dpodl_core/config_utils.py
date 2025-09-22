@@ -1,5 +1,10 @@
 import os
 import logging
+import hashlib
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,82 @@ def get_config():
         logger.info(f"Loading DEV configuration (DPODL_ENV={env})")
 
     return config
+
+def get_worker_security_config(worker_id=0):
+    """
+    Gets worker security configuration from environment variables.
+    
+    Args:
+        worker_id: The worker ID (0, 1, etc.) to get specific keys
+        
+    Returns:
+        dict: Security configuration for the worker
+    """
+    # Get worker-specific private key
+    worker_private_key = None
+    worker_address = None
+    
+    # Try worker-specific key first
+    env_key = f"WORKER_PRIVATE_KEY_{worker_id}"
+    if env_key in os.environ:
+        worker_private_key = os.environ[env_key]
+    # Fallback to generic test key
+    elif "TEST_WORKER_PRIVATE_KEY" in os.environ:
+        worker_private_key = os.environ["TEST_WORKER_PRIVATE_KEY"]
+        logger.info(f"Using TEST_WORKER_PRIVATE_KEY for worker {worker_id}")
+    
+    # Generate address from private key if we have one
+    if worker_private_key:
+        try:
+            from eth_account import Account
+            # Ensure proper format
+            if not worker_private_key.startswith('0x'):
+                worker_private_key = '0x' + worker_private_key
+            account = Account.from_key(worker_private_key)
+            worker_address = account.address
+            logger.info(f"Worker {worker_id} address: {worker_address}")
+        except Exception as e:
+            logger.error(f"Failed to derive address from private key for worker {worker_id}: {e}")
+            worker_private_key = None
+    
+    # Create a simple dataset hash (you can make this more sophisticated)
+    dataset_hash = os.environ.get("DATASET_HASH")
+    if not dataset_hash:
+        # Generate a default hash based on dataset name and environment
+        env = os.getenv("DPODL_ENV", "dev").lower()
+        dataset_name = "ag_news"  # Default, could be enhanced
+        hash_input = f"{dataset_name}_{env}_v1".encode('utf-8')
+        dataset_hash = hashlib.sha256(hash_input).hexdigest()
+        logger.info(f"Generated default dataset hash: {dataset_hash[:16]}...")
+    
+    return {
+        "worker_private_key": worker_private_key,
+        "worker_address": worker_address,
+        "dataset_hash": dataset_hash,
+        "secure_loading_enabled": worker_private_key is not None
+    }
+
+def enhance_config_with_security(base_config, worker_id=0):
+    """
+    Enhances the base config with worker security settings.
+    
+    Args:
+        base_config: The base configuration dict
+        worker_id: The worker ID for this specific worker
+        
+    Returns:
+        dict: Enhanced configuration with security settings
+    """
+    security_config = get_worker_security_config(worker_id)
+    enhanced_config = base_config.copy()
+    enhanced_config.update(security_config)
+    
+    if security_config["secure_loading_enabled"]:
+        logger.info(f"✓ Secure loading enabled for worker {worker_id}")
+    else:
+        logger.warning(f"⚠ Secure loading not available for worker {worker_id} - missing private key")
+    
+    return enhanced_config
 
 if __name__ == '__main__':
     # Test the config loader
