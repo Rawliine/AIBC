@@ -1,6 +1,43 @@
 # Project Setup and Usage Guide: D-PoDL
 
-This guide provides instructions for setting up and running the D-PoDL project for local development, testing, and basic usage. It reflects the actual workflow used in practice, based on terminal history.
+This guide provides instructions for setting up and running the D-PoDL project for local development, testing, and basic usage. It reflects the current, recommended workflow.
+
+## Quickstart (TL;DR)
+
+1. **One-time setup:**
+    ```bash
+    # Copy environment template
+    cp env.example .env
+    
+    # Install dependencies
+    make setup
+    ```
+
+2. **Start development environment (one command):**
+    ```bash
+    make dev-up
+    ```
+    This automatically:
+    - Initializes IPFS (if needed)
+    - Starts IPFS daemon in background
+    - Starts Hardhat node in background
+    - Compiles and deploys contracts
+    - Sets up health checks and logging
+
+3. **Run the trainer:**
+    ```bash
+    make trainer
+    ```
+
+4. **Stop everything when done:**
+    ```bash
+    make dev-down
+    ```
+
+**Alternative single commands:**
+- `make dev-status` - Check if services are running
+- `make logs-all` - Follow all service logs
+- `make test` - Run all tests
 
 ## 1. Prerequisites
 
@@ -46,6 +83,17 @@ ipfs init
 ipfs daemon
 ```
 
+Keep IPFS running after closing the terminal (optional):
+```bash
+mkdir -p ~/AIBC/logs
+nohup ipfs daemon > ~/AIBC/logs/ipfs.log 2>&1 & disown
+```
+
+Shut down IPFS when needed:
+```bash
+ipfs shutdown
+```
+
 ### Step 2: Deploy Blockchain Contracts (if needed)
 
 For local development, you'll start a local Hardhat node and deploy your contracts to it.
@@ -63,10 +111,10 @@ Navigate to the `blockchain/` directory (if not already there) and run:
 ```bash
 cd blockchain
 npx hardhat compile
-npx hardhat deploy --network hardhat
+npx hardhat deploy --network localhost
 cd .. 
 ```
-This deploys to the `hardhat` network which the `npx hardhat node` command just started.
+This deploys to the local `localhost` network served by your `hardhat node`.
 The `cd ..` returns you to the project root.
 
 ## 4. Running the D-PoDL System
@@ -108,6 +156,7 @@ The `test` environment relies on a small version of the AG News dataset. To gene
 *   **Logs:** Check `/tmp/ray/session_latest/logs/` for Ray logs if issues arise.
 *   **Network/Firewall:** Ensure ports 6379, 8076, 8077, and 8265 are open and accessible. Use `sudo iptables -A INPUT -p tcp --dport <port> -j ACCEPT` as needed.
 *   **IPFS:** If you see connection errors, ensure the daemon is running and accessible on port 5001.
+*   **Background logs:** If you background IPFS/Hardhat with `nohup`, use `tail -f ~/AIBC/logs/ipfs.log` or `tail -f ~/AIBC/logs/hardhat.log` to follow logs.
 
 ## 6. Testing
 
@@ -143,7 +192,7 @@ These are the essential steps to run the D-PoDL system for typical local develop
     *   **Terminal 2 (Deploy Contracts):**
         ```bash
         cd blockchain
-        npx hardhat compile && npx hardhat deploy --network hardhat
+        npx hardhat compile && npx hardhat deploy --network localhost
         cd ..
         ```
 
@@ -154,6 +203,21 @@ These are the essential steps to run the D-PoDL system for typical local develop
     ```
 
 This order ensures all dependencies are available.
+
+## 9. Recompile vs Redeploy
+
+* Always recompile after Solidity changes:
+    ```bash
+    cd blockchain && npx hardhat compile
+    ```
+* Redeploy only when you need new contract addresses or want to test updated on-chain logic:
+    ```bash
+    cd blockchain && npx hardhat deploy --network localhost
+    ```
+* For selective deploys, add tags to deploy scripts and run:
+    ```bash
+    npx hardhat deploy --network localhost --tags registry,mempool
+    ```
 
 ## 8. Project Structure Overview
 
