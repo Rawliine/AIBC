@@ -4,8 +4,8 @@ import os
 from unittest.mock import patch, MagicMock, mock_open
 
 # Adjust the import path based on your project structure
-from train.utils import save_checkpoint, load_checkpoint, collate_batch
-from train.model import DeeperTransformer # Use a simple model for testing state dict
+from dpodl_core.utils import save_checkpoint, load_checkpoint, collate_batch
+from dpodl_core.models import DeeperTransformer # Use a simple model for testing state dict
 
 # --- Fixtures ---
 
@@ -36,8 +36,8 @@ def sample_batch_data():
 
 # --- Test Functions ---
 
-@patch('train.utils.torch.save')
-@patch('train.utils.ipfshttpclient.connect')
+@patch('dpodl_core.utils.torch.save')
+@patch('dpodl_core.utils.ipfshttpclient.connect')
 @patch('builtins.open', new_callable=mock_open)
 def test_save_checkpoint(mock_file_open, mock_ipfs_connect, mock_torch_save, mock_model, mock_optimizer):
     """Tests the save_checkpoint function including IPFS upload."""
@@ -66,7 +66,7 @@ def test_save_checkpoint(mock_file_open, mock_ipfs_connect, mock_torch_save, moc
     assert 'optimizer_state_dict' in saved_data
 
     # Assert IPFS connect and add were called
-    mock_ipfs_connect.assert_called_once_with('/ip4/127.0.0.1/tcp/5001')
+    mock_ipfs_connect.assert_called_once_with('/ip4/127.0.0.1/tcp/5001', timeout=5)
     mock_client.add.assert_called_once_with(checkpoint_path)
 
     # Assert CID file was written to
@@ -78,8 +78,8 @@ def test_save_checkpoint(mock_file_open, mock_ipfs_connect, mock_torch_save, moc
     assert cid == expected_cid
 
 
-@patch('train.utils.os.path.isfile')
-@patch('train.utils.torch.load')
+@patch('dpodl_core.utils.os.path.isfile')
+@patch('dpodl_core.utils.torch.load')
 def test_load_checkpoint_exists(mock_torch_load, mock_isfile, mock_model, mock_optimizer):
     """Tests loading an existing checkpoint."""
     checkpoint_path = "test_checkpoint.pt"
@@ -102,7 +102,7 @@ def test_load_checkpoint_exists(mock_torch_load, mock_isfile, mock_model, mock_o
     load_optimizer = torch.optim.Adam(load_model.parameters())
 
     # Call the function
-    epoch, loss = load_checkpoint(checkpoint_path, load_model, load_optimizer)
+    epoch, loss, dpodl_state = load_checkpoint(checkpoint_path, load_model, load_optimizer)
 
     # Assertions
     mock_isfile.assert_called_once_with(checkpoint_path)
@@ -115,7 +115,7 @@ def test_load_checkpoint_exists(mock_torch_load, mock_isfile, mock_model, mock_o
     # but we check if load_state_dict was called implicitly by torch.load
 
 
-@patch('train.utils.os.path.isfile')
+@patch('dpodl_core.utils.os.path.isfile')
 def test_load_checkpoint_not_exists(mock_isfile, mock_model, mock_optimizer):
     """Tests loading when the checkpoint file doesn't exist."""
     checkpoint_path = "non_existent_checkpoint.pt"
@@ -126,7 +126,7 @@ def test_load_checkpoint_not_exists(mock_isfile, mock_model, mock_optimizer):
     load_optimizer = torch.optim.Adam(load_model.parameters())
 
     # Call the function
-    epoch, loss = load_checkpoint(checkpoint_path, load_model, load_optimizer)
+    epoch, loss, dpodl_state = load_checkpoint(checkpoint_path, load_model, load_optimizer)
 
     # Assertions
     mock_isfile.assert_called_once_with(checkpoint_path)
