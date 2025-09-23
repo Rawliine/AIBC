@@ -1,5 +1,34 @@
 # AI & Blockchain Project
 
+## Quickstart
+
+Get the full development environment running in 3 commands:
+
+```bash
+# 1. Copy environment template
+cp env.example .env
+
+# 2. Install dependencies  
+make setup
+
+# 3. Start everything (IPFS + Hardhat + Deploy + Health checks)
+make dev-up
+```
+
+Then run the D-PoDL trainer:
+```bash
+make trainer
+```
+
+Stop everything when done:
+```bash
+make dev-down
+```
+
+**Available commands**: `make help` • **Detailed guide**: [docs/SetupAndUsageGuide.md](docs/SetupAndUsageGuide.md) • **Startup docs**: [docs/OneCommandStartup.md](docs/OneCommandStartup.md)
+
+---
+
 ## Overview
 This project integrates **advanced Artificial Intelligence (AI)** technologies with **blockchain** to explore innovative solutions. The main objective is to develop a **robust infrastructure** for training large-scale AI models while leveraging blockchain for distributed storage, secure transactions, and reward mechanisms (e.g., miners contributing to AI training compute).
 

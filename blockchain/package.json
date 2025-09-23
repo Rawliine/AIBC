@@ -1,6 +1,16 @@
 {
   "name": "hardhat-project",
   "type": "commonjs",
+  "scripts": {
+    "node": "hardhat node",
+    "compile": "hardhat compile",
+    "deploy": "hardhat deploy --network localhost",
+    "deploy:sepolia": "hardhat deploy --network sepolia",
+    "test": "hardhat test",
+    "coverage": "hardhat coverage",
+    "verify:sepolia": "hardhat etherscan-verify --network sepolia",
+    "clean": "hardhat clean"
+  },
   "devDependencies": {
     "@nomicfoundation/hardhat-chai-matchers": "*",
     "@nomicfoundation/hardhat-ethers": "*",
