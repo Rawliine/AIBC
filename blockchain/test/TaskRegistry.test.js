@@ -84,7 +84,7 @@ describe("TaskRegistry", function () {
     });
 
     describe("Task Status Updates", function () {
-        let registry, owner, publisher1, taskId;
+        let registry, owner, publisher1, user1, taskId;
         const datasetId = "QmStatusDataset";
         const criteria = "Status Test";
         const targetAccBPS = 9500n;
@@ -93,7 +93,7 @@ describe("TaskRegistry", function () {
 
         // Setup: Submit a task before each status test
         beforeEach(async function(){
-            ({ registry, owner, publisher1 } = await loadFixture(deployTaskRegistryFixture));
+            ({ registry, owner, publisher1, user1 } = await loadFixture(deployTaskRegistryFixture));
             // Submit task as publisher1
             const tx = await registry.connect(publisher1).submitTask(datasetId, criteria, targetAccBPS, reward, duration);
             const receipt = await tx.wait();
@@ -156,7 +156,6 @@ describe("TaskRegistry", function () {
         });
         
          it("Should prevent non-owner/non-publisher from completing", async function(){
-             const { user1 } = await loadFixture(deployTaskRegistryFixture);
              await registry.connect(owner).startTask(taskId);
              await expect(registry.connect(user1).completeTask(taskId))
                  .to.be.revertedWithCustomError(registry, "Unauthorized");
@@ -196,7 +195,6 @@ describe("TaskRegistry", function () {
         });
 
          it("Should prevent non-owner/non-publisher from cancelling", async function(){
-             const { user1 } = await loadFixture(deployTaskRegistryFixture);
              await expect(registry.connect(user1).cancelTask(taskId))
                  .to.be.revertedWithCustomError(registry, "Unauthorized");
          });

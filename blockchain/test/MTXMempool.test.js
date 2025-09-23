@@ -60,7 +60,8 @@ describe("MTXMempool", function () {
                     accuracyBPS,
                     referenceModelCID,
                     submitter1.address,
-                    anyValue           // timestamp
+                    anyValue,          // timestamp
+                    0                  // status (Pending = 0)
                 );
 
             // Check state using getMtxDetails

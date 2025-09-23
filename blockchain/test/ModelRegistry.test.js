@@ -42,8 +42,11 @@ describe("ModelRegistry", function () {
             initialMinAccImprov,
             initialMinStepImprov,
             initialRefRewardShare,
-            tokenAddress,
-            owner.address // Explicitly set the owner
+            token.target, // _tokenAddress
+            owner.address, // _initialOwner
+            "QmGenesisModelStateCID", // _initialGenesisModelStateCID
+            "QmGenesisDpodlCheckpointCID", // _initialGenesisDpodlCheckpointCID
+            ethers.parseEther("10") // _initialMtxRewardAmount
         );
         await registry.waitForDeployment();
 
@@ -133,9 +136,12 @@ describe("ModelRegistry", function () {
                 initialT1Threshold,
                 initialAccuracyThresholdBPS,
                 initialBlockRewardAmount,
-                100n, 10000n, 100n, 50n, 2000n, // Add dummy args for new params
-                ethers.ZeroAddress, // Use ZeroAddress constant
-                owner.address
+                100n, 10000n, 100n, 50n, 2000n, // minSteps, maxSteps, minAccImprov, minStepImprov, refRewardShare
+                ethers.ZeroAddress, // _tokenAddress (zero address)
+                owner.address, // _initialOwner
+                "QmGenesisModelStateCID", // _initialGenesisModelStateCID
+                "QmGenesisDpodlCheckpointCID", // _initialGenesisDpodlCheckpointCID
+                ethers.parseEther("10") // _initialMtxRewardAmount
             )).to.be.revertedWithCustomError(ModelRegistry, "ZeroAddress");
         });
 
@@ -146,9 +152,12 @@ describe("ModelRegistry", function () {
                 initialT1Threshold,
                 initialAccuracyThresholdBPS,
                 initialBlockRewardAmount,
-                100n, 10000n, 100n, 50n, 2000n, // Add dummy args for new params
-                await token.getAddress(),
-                ethers.ZeroAddress // Use ZeroAddress constant
+                100n, 10000n, 100n, 50n, 2000n, // minSteps, maxSteps, minAccImprov, minStepImprov, refRewardShare
+                await token.getAddress(), // _tokenAddress
+                ethers.ZeroAddress, // _initialOwner (zero address)
+                "QmGenesisModelStateCID", // _initialGenesisModelStateCID
+                "QmGenesisDpodlCheckpointCID", // _initialGenesisDpodlCheckpointCID
+                ethers.parseEther("10") // _initialMtxRewardAmount
             )).to.be.revertedWithCustomError(ModelRegistry, "OwnableInvalidOwner") // Standard Ownable error
                 .withArgs(ethers.ZeroAddress);
         });
@@ -158,10 +167,14 @@ describe("ModelRegistry", function () {
             const ModelRegistry = await ethers.getContractFactory("ModelRegistry"); // Get factory here
             await expect(ModelRegistry.deploy(
                 initialT1Threshold,
-                10001n, // Invalid BPS > 10000
-                100n, 10000n, 100n, 50n, 2000n, // Add dummy args for new params
-                await token.getAddress(),
-                owner.address
+                10001n, // Invalid BPS > 10000 (_initialTAccuracyThresholdBPS)
+                initialBlockRewardAmount,
+                100n, 10000n, 100n, 50n, 2000n, // minSteps, maxSteps, minAccImprov, minStepImprov, refRewardShare
+                await token.getAddress(), // _tokenAddress
+                owner.address, // _initialOwner
+                "QmGenesisModelStateCID", // _initialGenesisModelStateCID
+                "QmGenesisDpodlCheckpointCID", // _initialGenesisDpodlCheckpointCID
+                ethers.parseEther("10") // _initialMtxRewardAmount
             )).to.be.revertedWith("Accuracy BPS cannot exceed 10000");
         });
 
@@ -174,8 +187,11 @@ describe("ModelRegistry", function () {
                 initialBlockRewardAmount,
                 100n, 10000n, 100n, 50n,
                 10001n, // Invalid ref share > 10000
-                await token.getAddress(),
-                owner.address
+                await token.getAddress(), // _tokenAddress
+                owner.address, // _initialOwner
+                "QmGenesisModelStateCID", // _initialGenesisModelStateCID
+                "QmGenesisDpodlCheckpointCID", // _initialGenesisDpodlCheckpointCID
+                ethers.parseEther("10") // _initialMtxRewardAmount
             )).to.be.revertedWith("Reference reward share BPS cannot exceed 10000");
         });
     });
@@ -192,19 +208,21 @@ describe("ModelRegistry", function () {
            const steps = 1000n; // Placeholder steps value
 
            await expect(registry.connect(proposer1).submitBlock(
-               modelCID,
-               accuracyBPS,
-               steps,
-               t1Hash,
-               genesisReferenceCID
+               modelCID,                // _newModelStateCID
+               "QmDpodlCheckpointCID",  // _newDpodlCheckpointCID 
+               accuracyBPS,             // _accuracyBPS
+               steps,                   // _steps
+               t1Hash,                  // _postHash
+               "QmGenesisDpodlCheckpointCID" // _referenceDpodlCheckpointCID (must match constructor value)
            ))
                .to.emit(registry, "ModelAccepted")
                .withArgs(
                    1,                     // blockHeight
-                   modelCID,            // ipfsCID
+                   modelCID,            // modelStateCID
+                   "QmDpodlCheckpointCID", // dpodlCheckpointCID
                    accuracyBPS,         // accuracyBPS
                    t1Hash,              // postHash
-                   genesisReferenceCID, // referenceModelCID
+                   "QmGenesisDpodlCheckpointCID", // referenceModelCID (must match constructor value)
                    proposer1.address,   // proposer
                    anyValue             // timestamp (ignore value)
                );
@@ -218,16 +236,16 @@ describe("ModelRegistry", function () {
            expect(blockDetails.proposer).to.equal(proposer1.address);
            expect(blockDetails.accuracyBPS).to.equal(accuracyBPS);
            expect(blockDetails.postHash).to.equal(t1Hash);
-           expect(blockDetails.referenceModelCID).to.equal(genesisReferenceCID);
+           expect(blockDetails.referenceModelCID).to.equal("QmGenesisDpodlCheckpointCID");
            // Now check the problematic field with the CORRECT name
-           expect(blockDetails.ipfsCID).to.equal(modelCID); // Use ipfsCID
+           expect(blockDetails.modelStateCID).to.equal(modelCID); // Use modelStateCID
            // Add check for steps if needed: expect(blockDetails.steps).to.equal(steps);
 
            // Now check the helper view function
            expect(await registry.getCurrentReferenceModel()).to.equal(modelCID);
 
-           // Check the reverse lookup mapping
-           expect(await registry.getBlockHeightForCID(modelCID)).to.equal(1);
+           // Check the reverse lookup mapping (uses DPoDL checkpoint CID, not model CID)
+           expect(await registry.getBlockHeightForCID("QmDpodlCheckpointCID")).to.equal(1);
        });
 
        it("Should reward the proposer with tokens upon successful submission", async function() {
@@ -241,11 +259,12 @@ describe("ModelRegistry", function () {
            const rewardAmount = await registry.blockRewardAmount();
 
            await registry.connect(proposer1).submitBlock(
-               modelCID,
-               accuracyBPS,
-               steps,
-               t1Hash,
-               genesisReferenceCID
+               modelCID,                // _newModelStateCID
+               "QmDpodlCheckpointCID",  // _newDpodlCheckpointCID
+               accuracyBPS,             // _accuracyBPS
+               steps,                   // _steps
+               t1Hash,                  // _postHash
+               "QmGenesisDpodlCheckpointCID" // _referenceDpodlCheckpointCID
            );
 
            const finalBalance = await token.balanceOf(proposer1.address);
@@ -258,17 +277,19 @@ describe("ModelRegistry", function () {
             const secondCID = "secondRewardSplitCID";
             const t1Hash1 = "0x" + "0".repeat(63) + "A";
             const t1Hash2 = "0x" + "0".repeat(63) + "B";
-            const accuracyBPS = 9000n;
-            const steps = 500n;
+            const firstAccuracyBPS = 9000n;  // First block accuracy
+            const secondAccuracyBPS = 9200n; // Second block has improved accuracy
+            const firstSteps = 500n;          // First block steps
+            const secondSteps = 600n;         // Second block has more training steps
             const genesisRef = "";
 
             // ReferenceProposer submits the first block
-            await registry.connect(referenceProposer).submitBlock(firstCID, accuracyBPS, steps, t1Hash1, genesisRef);
+            await registry.connect(referenceProposer).submitBlock(firstCID, "QmDpodlCheckpointCID1", firstAccuracyBPS, firstSteps, t1Hash1, "QmGenesisDpodlCheckpointCID");
             const refProposerInitialBalance = await token.balanceOf(referenceProposer.address);
 
-            // Proposer1 submits the second block, referencing the first
+            // Proposer1 submits the second block, referencing the first (with improved accuracy)
             const proposer1InitialBalance = await token.balanceOf(proposer1.address);
-            await registry.connect(proposer1).submitBlock(secondCID, accuracyBPS, steps, t1Hash2, firstCID);
+            await registry.connect(proposer1).submitBlock(secondCID, "QmDpodlCheckpointCID2", secondAccuracyBPS, secondSteps, t1Hash2, "QmDpodlCheckpointCID1");
 
             // Calculate expected rewards
             const totalReward = await registry.blockRewardAmount();
@@ -290,16 +311,18 @@ describe("ModelRegistry", function () {
             const secondCID = "selfReferenceCID2";
             const t1Hash1 = "0x" + "0".repeat(63) + "C";
             const t1Hash2 = "0x" + "0".repeat(63) + "D";
-            const accuracyBPS = 9000n;
-            const steps = 500n;
+            const firstAccuracyBPS = 9000n;  // First block accuracy  
+            const secondAccuracyBPS = 9250n; // Second block has improved accuracy
+            const firstSteps = 500n;          // First block steps
+            const secondSteps = 600n;         // Second block has more training steps
             const genesisRef = "";
 
             // Proposer1 submits the first block
-            await registry.connect(proposer1).submitBlock(firstCID, accuracyBPS, steps, t1Hash1, genesisRef);
+            await registry.connect(proposer1).submitBlock(firstCID, "QmDpodlCheckpointCID1", firstAccuracyBPS, firstSteps, t1Hash1, "QmGenesisDpodlCheckpointCID");
             const proposer1BalanceAfterFirst = await token.balanceOf(proposer1.address);
 
-            // Proposer1 submits the second block, referencing their own first block
-            await registry.connect(proposer1).submitBlock(secondCID, accuracyBPS, steps, t1Hash2, firstCID);
+            // Proposer1 submits the second block, referencing their own first block (with improved accuracy)
+            await registry.connect(proposer1).submitBlock(secondCID, "QmDpodlCheckpointCID2", secondAccuracyBPS, secondSteps, t1Hash2, "QmDpodlCheckpointCID1");
 
             // Calculate expected reward (should be full amount)
             const totalReward = await registry.blockRewardAmount();
@@ -320,40 +343,42 @@ describe("ModelRegistry", function () {
            const wrongRef = "wrongCID";
 
            // Submit the first block
-           await registry.connect(proposer1).submitBlock(firstCID, initialAccuracy, initialSteps, initialPostHash, genesisRef);
+           await registry.connect(proposer1).submitBlock(firstCID, "QmDpodlCheckpointCID1", initialAccuracy, initialSteps, initialPostHash, "QmGenesisDpodlCheckpointCID");
 
            // Attempt to submit the second block with the wrong reference
            await expect(registry.connect(proposer2).submitBlock(
-               secondCID, initialAccuracy, initialSteps, initialPostHash, wrongRef // Using wrongRef
+               secondCID, "QmDpodlCheckpointCID2", initialAccuracy, initialSteps, initialPostHash, wrongRef // Using wrongRef
            )).to.be.revertedWithCustomError(registry, "InvalidReferenceModel")
-             .withArgs(wrongRef, firstCID); // Expect revert with submitted and expected CIDs
+             .withArgs(wrongRef, "QmDpodlCheckpointCID1"); // Expect revert with submitted and expected CIDs
        });
 
        it("Should allow submitting a second block referencing the first", async function() {
            const { registry, proposer1, proposer2 } = await loadFixture(deployContractsAndTokenFixture);
            const firstCID = "testCID";
            const secondCID = "testCID2";
-           const initialAccuracy = 9000n;
-           const initialSteps = 1000n;
+           const firstAccuracy = 9000n;   // First block accuracy
+           const secondAccuracy = 9200n;  // Second block improved accuracy
+           const firstSteps = 1000n;      // First block steps
+           const secondSteps = 1100n;     // Second block more steps
            const initialPostHash = "0x" + "0".repeat(63) + "1";
            const secondPostHash = "0x" + "0".repeat(63) + "2";
            const genesisRef = "";
 
            // Submit the first block
-           await registry.connect(proposer1).submitBlock(firstCID, initialAccuracy, initialSteps, initialPostHash, genesisRef);
+           await registry.connect(proposer1).submitBlock(firstCID, "QmDpodlCheckpointCID1", firstAccuracy, firstSteps, initialPostHash, "QmGenesisDpodlCheckpointCID");
 
-           // Submit the second block referencing the first
+           // Submit the second block referencing the first (with improved accuracy and steps)
            await expect(registry.connect(proposer2).submitBlock(
-               secondCID, initialAccuracy, initialSteps, secondPostHash, firstCID // Correct reference
+               secondCID, "QmDpodlCheckpointCID2", secondAccuracy, secondSteps, secondPostHash, "QmDpodlCheckpointCID1" // Correct reference
            )).to.emit(registry, "ModelAccepted")
-             .withArgs(2, secondCID, initialAccuracy, secondPostHash, firstCID, proposer2.address, anyValue);
+             .withArgs(2, secondCID, "QmDpodlCheckpointCID2", secondAccuracy, secondPostHash, "QmDpodlCheckpointCID1", proposer2.address, anyValue);
 
            // Verify details of the second block
            expect(await registry.currentBlockHeight()).to.equal(2);
            expect(await registry.getCurrentReferenceModel()).to.equal(secondCID);
            const blockDetails = await registry.getBlockDetails(2);
-           expect(blockDetails.ipfsCID).to.equal(secondCID); // Use ipfsCID
-           expect(blockDetails.referenceModelCID).to.equal(firstCID); // <<< Key check here
+           expect(blockDetails.modelStateCID).to.equal(secondCID); // Use modelStateCID
+           expect(blockDetails.referenceModelCID).to.equal("QmDpodlCheckpointCID1"); // Reference the DPoDL checkpoint CID
        });
 
        it("Should fail if accuracy is below threshold", async function() {
@@ -366,10 +391,11 @@ describe("ModelRegistry", function () {
 
            await expect(registry.connect(proposer1).submitBlock(
                modelCID,
+               "QmDpodlCheckpointCID",
                lowAccuracy, // Below threshold
                steps,
                postHash,
-               genesisRef
+               "QmGenesisDpodlCheckpointCID"
            )).to.be.revertedWithCustomError(registry, "AccuracyThresholdNotMet")
              .withArgs(lowAccuracy, initialAccuracyThresholdBPS);
        });
@@ -385,10 +411,11 @@ describe("ModelRegistry", function () {
 
            await expect(registry.connect(proposer1).submitBlock(
                modelCID,
+               "QmDpodlCheckpointCID",
                highAccuracy,
                steps,
                highPostHash, // Equal to threshold
-               genesisRef
+               "QmGenesisDpodlCheckpointCID"
            )).to.be.revertedWithCustomError(registry, "HashThresholdNotMet")
              .withArgs(highPostHash, initialT1Threshold);
 
@@ -396,10 +423,11 @@ describe("ModelRegistry", function () {
             const higherPostHash = initialT1Threshold + 1n; // Should also fail
             await expect(registry.connect(proposer1).submitBlock(
                 modelCID,
+                "QmDpodlCheckpointCID",
                 highAccuracy,
                 steps,
                 higherPostHash, // Greater than threshold
-                genesisRef
+                "QmGenesisDpodlCheckpointCID"
             )).to.be.revertedWithCustomError(registry, "HashThresholdNotMet")
               .withArgs(higherPostHash, initialT1Threshold);
        });
@@ -408,7 +436,7 @@ describe("ModelRegistry", function () {
     });
 
     describe("Parameter Updates", function () {
-        // Tests for setT1Threshold, setTAccuracyThresholdBPS, setBlockRewardAmount, setTokenAddress
+        // Tests for setT1Threshold, setTAccuracyThresholdBPS, setBlockRewardAmount, setDpdlToken
         // Including owner checks and event emissions
         it("Should allow owner to update T1 threshold", async function() {
             const { registry, owner } = await loadFixture(deployContractsAndTokenFixture);
@@ -472,7 +500,7 @@ describe("ModelRegistry", function () {
         it("Should allow owner to update token address", async function() {
             const { registry, owner, addrs } = await loadFixture(deployContractsAndTokenFixture);
             const newTokenAddress = addrs[0].address; // Use some other address
-            await expect(registry.connect(owner).setTokenAddress(newTokenAddress))
+            await expect(registry.connect(owner).setDpdlToken(newTokenAddress))
                 .to.emit(registry, "ParameterUpdated")
                 .withArgs("dpdlToken", BigInt(newTokenAddress)); // Event emits address as uint
             expect(await registry.dpdlToken()).to.equal(newTokenAddress);
@@ -481,18 +509,18 @@ describe("ModelRegistry", function () {
         it("Should prevent non-owner from updating token address", async function() {
             const { registry, proposer1, addrs } = await loadFixture(deployContractsAndTokenFixture);
             const newTokenAddress = addrs[0].address;
-            await expect(registry.connect(proposer1).setTokenAddress(newTokenAddress))
+            await expect(registry.connect(proposer1).setDpdlToken(newTokenAddress))
                 .to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount")
                 .withArgs(proposer1.address);
         });
 
         it("Should fail updating token address to the zero address", async function() {
             const { registry, owner } = await loadFixture(deployContractsAndTokenFixture);
-            await expect(registry.connect(owner).setTokenAddress(ethers.ZeroAddress))
+            await expect(registry.connect(owner).setDpdlToken(ethers.ZeroAddress))
                 .to.be.revertedWithCustomError(registry, "ZeroAddress");
         });
 
-        // TODO: Tests for setTokenAddress
+        // TODO: Tests for setDpdlToken
         // etc.
     });
 
@@ -506,11 +534,11 @@ describe("ModelRegistry", function () {
             const initialPostHash = "0x" + "0".repeat(63) + "1";
             const genesisRef = "";
 
-            // Check initial state (should be genesis CID, which is "")
-            expect(await registry.getCurrentReferenceModel()).to.equal(genesisRef);
+            // Check initial state (should be genesis model state CID)
+            expect(await registry.getCurrentReferenceModel()).to.equal("QmGenesisModelStateCID");
 
             // Submit the first block
-            await registry.connect(proposer1).submitBlock(firstCID, initialAccuracy, initialSteps, initialPostHash, genesisRef);
+            await registry.connect(proposer1).submitBlock(firstCID, "QmDpodlCheckpointCID1", initialAccuracy, initialSteps, initialPostHash, "QmGenesisDpodlCheckpointCID");
 
             // Check after first block (should be the first block's CID)
             expect(await registry.getCurrentReferenceModel()).to.equal(firstCID);
@@ -525,18 +553,18 @@ describe("ModelRegistry", function () {
             const genesisRef = "";
 
             // Submit the first block
-            await registry.connect(proposer1).submitBlock(modelCID, accuracyBPS, steps, postHash, genesisRef);
+            await registry.connect(proposer1).submitBlock(modelCID, "QmDpodlCheckpointDetails", accuracyBPS, steps, postHash, "QmGenesisDpodlCheckpointCID");
 
             // Get details of block 1
             const blockDetails = await registry.getBlockDetails(1);
 
             // Verify all fields
             expect(blockDetails.blockHeight).to.equal(1);
-            expect(blockDetails.ipfsCID).to.equal(modelCID);
+            expect(blockDetails.modelStateCID).to.equal(modelCID);
             expect(blockDetails.accuracyBPS).to.equal(accuracyBPS);
             expect(blockDetails.steps).to.equal(steps);
             expect(blockDetails.postHash).to.equal(postHash);
-            expect(blockDetails.referenceModelCID).to.equal(genesisRef);
+            expect(blockDetails.referenceModelCID).to.equal("QmGenesisDpodlCheckpointCID");
             expect(blockDetails.proposer).to.equal(proposer1.address);
             // Timestamp is harder to check exactly, check it's non-zero
             expect(blockDetails.timestamp).to.be.gt(0);
@@ -549,7 +577,7 @@ describe("ModelRegistry", function () {
             const block0Details = await registry.getBlockDetails(0);
             expect(block0Details.proposer).to.equal(ethers.ZeroAddress);
             expect(block0Details.blockHeight).to.equal(0);
-            expect(block0Details.ipfsCID).to.equal(""); // Expect empty string for string fields
+            expect(block0Details.modelStateCID).to.equal(""); // Expect empty string for string fields
 
              // A block height far in the future
              const futureBlockDetails = await registry.getBlockDetails(9999);
@@ -566,10 +594,10 @@ describe("ModelRegistry", function () {
             const genesisRef = "";
 
             // Submit the first block
-            await registry.connect(proposer1).submitBlock(modelCID, accuracyBPS, steps, postHash, genesisRef);
+            await registry.connect(proposer1).submitBlock(modelCID, "QmDpodlCheckpointHeight", accuracyBPS, steps, postHash, "QmGenesisDpodlCheckpointCID");
 
-            // Check the lookup
-            expect(await registry.getBlockHeightForCID(modelCID)).to.equal(1);
+            // Check the lookup (uses DPoDL checkpoint CID, not model CID)
+            expect(await registry.getBlockHeightForCID("QmDpodlCheckpointHeight")).to.equal(1);
         });
 
         it("Should return 0 for an unknown CID", async function() {
