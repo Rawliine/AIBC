@@ -16,3 +16,5 @@ requests
 tqdm
 safetensors>=0.4.0
 eth-account>=0.9.0
+datasets>=2.0.0
+transformers>=4.0.0
