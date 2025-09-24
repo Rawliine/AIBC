@@ -106,13 +106,52 @@ def test_load_checkpoint_exists(mock_torch_load, mock_isfile, mock_model, mock_o
 
     # Assertions
     mock_isfile.assert_called_once_with(checkpoint_path)
-    mock_torch_load.assert_called_once_with(checkpoint_path, map_location="cpu")
+    mock_torch_load.assert_called_once_with(checkpoint_path, map_location="cpu", weights_only=True)
     assert epoch == expected_epoch
     assert loss == expected_loss
     # Check if state dicts were loaded (simple check)
     assert torch.equal(load_model.embedding.weight, mock_model.embedding.weight)
     # Optimizer state loading is harder to verify precisely without internal knowledge,
     # but we check if load_state_dict was called implicitly by torch.load
+
+
+@patch('dpodl_core.utils.os.path.isfile')
+@patch('dpodl_core.utils.torch.load')
+def test_load_checkpoint_secure_fallback(mock_torch_load, mock_isfile, mock_model, mock_optimizer):
+    """Tests loading checkpoint with fallback from weights_only=True to weights_only=False."""
+    checkpoint_path = "test_checkpoint.pt"
+    expected_epoch = 3
+    expected_loss = 0.456
+    mock_model_state = mock_model.state_dict()
+    mock_optimizer_state = mock_optimizer.state_dict()
+    
+    # Configure mocks - first call fails, second succeeds
+    mock_isfile.return_value = True
+    mock_torch_load.side_effect = [
+        Exception("weights_only=True failed"),  # First call fails
+        {  # Second call succeeds
+            "epoch": expected_epoch,
+            "model_state_dict": mock_model_state,
+            "optimizer_state_dict": mock_optimizer_state,
+            "loss": expected_loss
+        }
+    ]
+    
+    # Create fresh model/optimizer instances to load into
+    load_model = DeeperTransformer(vocab_size=100, embed_dim=16, seq_len=8, num_heads=2, num_layers=1, num_classes=2)
+    load_optimizer = torch.optim.Adam(load_model.parameters())
+    
+    # Call the function
+    epoch, loss, dpodl_state = load_checkpoint(checkpoint_path, load_model, load_optimizer)
+    
+    # Assertions
+    mock_isfile.assert_called_once_with(checkpoint_path)
+    # Should be called twice: first with weights_only=True, then with weights_only=False
+    assert mock_torch_load.call_count == 2
+    mock_torch_load.assert_any_call(checkpoint_path, map_location="cpu", weights_only=True)
+    mock_torch_load.assert_any_call(checkpoint_path, map_location="cpu", weights_only=False)
+    assert epoch == expected_epoch
+    assert loss == expected_loss
 
 
 @patch('dpodl_core.utils.os.path.isfile')
