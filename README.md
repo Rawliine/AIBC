@@ -27,6 +27,12 @@ make dev-down
 
 **Available commands**: `make help` • **Detailed guide**: [docs/SetupAndUsageGuide.md](docs/SetupAndUsageGuide.md) • **Startup docs**: [docs/OneCommandStartup.md](docs/OneCommandStartup.md)
 
+### Quick Commands
+- `make trainer` - Run the D-PoDL training system
+- `make clear-mempool` - Clear old/buggy MTXs from blockchain mempool  
+- `make test` - Run all tests
+- `make logs-all` - View all service logs
+
 ---
 
 ## Overview

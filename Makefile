@@ -3,7 +3,7 @@
 # =============================================================================
 
 .PHONY: help setup dev-up dev-down dev-status logs-ipfs logs-hardhat logs-all
-.PHONY: chain deploy test test-e2e trainer clean
+.PHONY: chain deploy test test-e2e trainer clean clear-mempool
 
 # Default Python and package manager
 PYTHON := python
@@ -27,6 +27,7 @@ help:
 	@echo "  logs-all     - Tail all service logs"
 	@echo "  test         - Run all tests (Python + Solidity)"
 	@echo "  test-e2e     - Run end-to-end scenario test"
+	@echo "  clear-mempool- Clear old buggy MTXs from mempool (restarts Hardhat)"
 	@echo "  clean        - Clean logs and temporary files"
 
 # =============================================================================
@@ -151,3 +152,7 @@ clean:
 	rm -rf $(LOGS_DIR)
 	mkdir -p $(LOGS_DIR)
 	@echo "Cleanup complete."
+
+clear-mempool:
+	@echo "Clearing old buggy MTXs from mempool..."
+	./scripts/clear_mempool.sh

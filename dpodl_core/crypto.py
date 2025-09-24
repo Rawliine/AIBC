@@ -6,6 +6,7 @@ from collections import OrderedDict
 import math # Added for Merkle tree padding
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from web3 import Web3
 import time
 
 # Configure logging for this module
@@ -483,8 +484,8 @@ def verify_manifest_signature(
         recovered_address = Account.recover_message(encoded_data, signature=signature_hex)
         
         # Normalize addresses for comparison (checksummed)
-        recovered_address = Account.to_checksum_address(recovered_address)
-        expected_signer = Account.to_checksum_address(expected_signer)
+        recovered_address = Web3.to_checksum_address(recovered_address)
+        expected_signer = Web3.to_checksum_address(expected_signer)
         
         is_valid = recovered_address == expected_signer
         
@@ -513,7 +514,7 @@ def recover_manifest_signer(signature_hex: str, structured_data: dict) -> str | 
     try:
         encoded_data = encode_typed_data(full_message=structured_data)
         recovered_address = Account.recover_message(encoded_data, signature=signature_hex)
-        return Account.to_checksum_address(recovered_address)
+        return Web3.to_checksum_address(recovered_address)
     except Exception as e:
         logger.error(f"Error recovering signer from EIP-712 signature: {e}")
         return None

@@ -343,14 +343,8 @@ def _send_signed_transaction(w3_instance, chain_id, transaction, private_key):
         
         signed_tx = w3_instance.eth.account.sign_transaction(transaction, private_key)
 
-        # --- Advanced Inspection of SignedTransaction object ---
-        logger.info("--- Advanced SignedTransaction Object Inspection ---")
-        logger.info(f"Type of signed_tx: {type(signed_tx)}")
-        logger.info(f"Attributes of signed_tx (dir()): {dir(signed_tx)}")
-        logger.info(f"signed_tx object (repr()): {repr(signed_tx)}")
-
+        # Extract raw transaction bytes for sending
         raw_tx_bytes_for_sending = None
-        found_attribute_name = None
         potential_raw_tx_attributes = [
             'rawTransaction', 'raw_transaction', 'rlp', 'rlp_encoded', 
             'serialized', 'signed_transaction_bytes'
@@ -361,11 +355,8 @@ def _send_signed_transaction(w3_instance, chain_id, transaction, private_key):
                 value = getattr(signed_tx, attr_name, None)
                 if value is not None and isinstance(value, bytes):
                     raw_tx_bytes_for_sending = value
-                    found_attribute_name = attr_name
-                    logger.info(f"SUCCESS: Found raw transaction bytes in attribute '{found_attribute_name}'. Type: {type(raw_tx_bytes_for_sending)}, Value (hex): {raw_tx_bytes_for_sending.hex()}")
+                    logger.debug(f"Found raw transaction bytes in attribute '{attr_name}'")
                     break # Found it, no need to check others
-                elif value is not None:
-                    logger.info(f"Found attribute '{attr_name}' but it's not bytes. Type: {type(value)}, Value: {value}")
             except AttributeError:
                 logger.debug(f"Attribute '{attr_name}' not found on signed_tx.")
             except Exception as e_getattr:
@@ -376,8 +367,7 @@ def _send_signed_transaction(w3_instance, chain_id, transaction, private_key):
             # Consider raising the original AttributeError if it was for 'rawTransaction', or a more general one.
             raise AttributeError(f"Could not find raw transaction bytes in SignedTransaction object. Inspected attributes: {potential_raw_tx_attributes}. Object representation: {repr(signed_tx)}")
         
-        logger.info(f"Using attribute '{found_attribute_name}' for raw transaction bytes.")
-        # --- End of Advanced Inspection ---
+        # Transaction ready for sending
 
         # Send transaction
         logger.info(f"Sending transaction from {address} (Nonce: {nonce})...")

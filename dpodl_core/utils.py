@@ -265,7 +265,15 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: tor
     if os.path.isfile(checkpoint_path):
         try:
             logger.info(f"Loading checkpoint from {checkpoint_path}...")
-            checkpoint = torch.load(checkpoint_path, map_location="cpu") 
+            
+            # Try weights_only=True first for security, fallback to unsafe if needed
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+                logger.info("Checkpoint loaded with weights_only=True (secure mode)")
+            except Exception as weights_only_err:
+                logger.warning(f"weights_only=True failed, falling back to unsafe mode: {weights_only_err}")
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                logger.warning("Checkpoint loaded with weights_only=False (unsafe mode)")
             
             model.load_state_dict(checkpoint["model_state_dict"])
             if optimizer and 'optimizer_state_dict' in checkpoint:

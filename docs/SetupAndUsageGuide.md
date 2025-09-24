@@ -158,6 +158,37 @@ The `test` environment relies on a small version of the AG News dataset. To gene
 *   **IPFS:** If you see connection errors, ensure the daemon is running and accessible on port 5001.
 *   **Background logs:** If you background IPFS/Hardhat with `nohup`, use `tail -f ~/AIBC/logs/ipfs.log` or `tail -f ~/AIBC/logs/hardhat.log` to follow logs.
 
+### Common Issues and Solutions
+
+#### MTX Evaluation Issues
+If you see "Could not find 'accuracy' in DPoDL state" or MTXs being skipped:
+- **Cause**: The system stores accuracy as `accuracy_bps` (basis points 0-10000) but was looking for `accuracy`
+- **Solution**: This has been fixed automatically. MTXs now properly convert `accuracy_bps` to `accuracy` (divide by 10000)
+
+#### PyTorch Security Warnings
+If you see `FutureWarning: You are using torch.load with weights_only=False`:
+- **Cause**: Unsafe checkpoint loading
+- **Solution**: The system now uses secure loading with `weights_only=True` and fallback for compatibility
+
+#### EIP-712 Signature Failures
+If you see "EIP-712 signature verification failed" for old MTXs:
+- **Cause**: Old MTXs were signed with incorrect worker keys before the signature fix
+- **Solution**: Clear old MTXs from mempool:
+  ```bash
+  make clear-mempool
+  ```
+
+#### Clear Old/Buggy Data
+To start with a clean slate:
+```bash
+# Clear old MTXs from blockchain mempool
+make clear-mempool
+
+# Or restart development environment completely
+make dev-down
+make dev-up
+```
+
 ## 6. Testing
 
 Run Python tests:

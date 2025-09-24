@@ -679,9 +679,55 @@ The system is designed for extensibility:
 - **Configuration Templates**: Multiple .env templates
 - **Service Discovery**: Automatic service registration
 
+## Recent Improvements and Fixes
+
+### System Reliability Enhancements
+
+The startup system includes several critical fixes that ensure reliable operation:
+
+#### 1. MTX Processing Reliability
+- **Issue**: MTX evaluations were failing due to accuracy field mismatch
+- **Fix**: Automatic conversion from `accuracy_bps` (basis points) to `accuracy` decimal values
+- **Impact**: All MTXs now process correctly without manual intervention
+
+#### 2. Secure Checkpoint Loading
+- **Issue**: PyTorch security warnings for unsafe checkpoint loading
+- **Fix**: Implemented secure loading with `weights_only=True` and backward-compatible fallback
+- **Impact**: Enhanced security while maintaining compatibility with existing checkpoints
+
+#### 3. Mempool Management
+- **Issue**: Old MTXs with invalid signatures blocking processing
+- **Fix**: Added `make clear-mempool` command to reset blockchain state
+- **Impact**: Developers can easily clear problematic state during development
+
+#### 4. EIP-712 Signature Verification
+- **Issue**: Worker key distribution causing signature mismatches
+- **Fix**: Proper worker-specific key handling for secure model submissions
+- **Impact**: All MTX submissions now have valid signatures
+
+### Additional Commands
+
+The startup system now includes additional maintenance commands:
+
+```bash
+# Clear old/problematic MTXs from mempool
+make clear-mempool
+
+# Check system status
+make dev-status
+
+# View all logs
+make logs-all
+
+# Clean up logs and temporary files
+make clean
+```
+
 ## Conclusion
 
 The One-Command Startup System significantly reduces the complexity of local development for the AIBC project. By automating the orchestration of multiple services, providing robust health checks, and offering comprehensive monitoring, it enables developers to focus on building features rather than managing infrastructure.
+
+Recent improvements have enhanced system reliability, security, and maintainability. The system now automatically handles complex data format conversions, implements secure loading practices, and provides tools for managing blockchain state during development.
 
 The system balances simplicity with flexibility, providing sensible defaults while allowing for extensive customization. Its modular design ensures that it can evolve with the project's needs while maintaining backward compatibility.
 

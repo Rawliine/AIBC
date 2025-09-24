@@ -26,7 +26,7 @@ from .blockchain_interface import (
     # For now, assume it will be added to blockchain_interface and called
 )
 from .config_utils import get_config, enhance_config_with_security # Import the new config utility
-from .ipfs_utils import load_pickled_dict_from_ipfs # Added for MTX processing
+from .ipfs_utils import load_secure_model_artifacts # Added for secure MTX processing
 
 # Configure logging if not already done globally
 # logging.basicConfig(level=logging.INFO) 
@@ -144,7 +144,11 @@ def run_training(
         # --- Worker Configuration --- 
         # Get security configuration (we'll use worker 0 settings as default for all workers for now)
         # In a production setup, you might want to distribute different keys to different workers
-        base_security_config = enhance_config_with_security(app_config, worker_id=0)
+        # Pass base config without worker-specific keys - workers will load their own
+        base_security_config = {
+            "dataset_hash": enhance_config_with_security(app_config, worker_id=0).get("dataset_hash"),
+            "secure_loading_enabled": True
+        }
         
         train_loop_config = {
             # Data/Model params
@@ -169,10 +173,9 @@ def run_training(
             "ipfs_enabled": app_config["ipfs_enabled"], # Pass IPFS enabled flag
             "model_override_params": app_config.get("model_override_params"), # Pass model override
             # Security configuration for secure model loading
-            "worker_private_key": base_security_config.get("worker_private_key"),
-            "worker_address": base_security_config.get("worker_address"),
             "dataset_hash": base_security_config.get("dataset_hash"),
             "secure_loading_enabled": base_security_config.get("secure_loading_enabled", False)
+            # Note: worker_private_key and worker_address loaded per worker in worker.py
         }
         # logger.info(f"Worker config prepared: {train_loop_config}") # Logged later if needed
 
@@ -281,24 +284,43 @@ def run_training(
             logger.info(f"Found {len(pending_mtxs_from_chain)} pending MTXs in contract. Evaluating...")
             for mtx_data in pending_mtxs_from_chain:
                 logger.info(f"Processing MTX ID: {mtx_data['mtxId']}, Submitter: {mtx_data['submitter']}, Checkpoint CID: {mtx_data['ipfsCID']}")
-                dpodl_state_checkpoint = load_pickled_dict_from_ipfs(mtx_data['ipfsCID'], name=f"MTX_{mtx_data['mtxId']}_DPoDL_State")
-                if dpodl_state_checkpoint:
-                    accuracy = dpodl_state_checkpoint.get("accuracy") # This is the float accuracy 0.0 to 1.0
-                    if accuracy is not None:
-                        evaluated_mtxs.append({
-                            "mtxId": mtx_data['mtxId'],
-                            "ipfsCID": mtx_data['ipfsCID'],
-                            "submitter": mtx_data['submitter'],
-                            "accuracy": accuracy, # Storing the float accuracy
-                            "accuracyBPS_reported": mtx_data['accuracyBPS'], # Keep the originally reported one for comparison if needed
-                            "steps": mtx_data['steps'],
-                            "referenceModelCID": mtx_data['referenceModelCID']
-                        })
-                        logger.info(f"  Successfully evaluated MTX ID {mtx_data['mtxId']}. Fetched Accuracy: {accuracy:.4f}")
+                
+                # Load secure MTX artifacts
+                mtx_artifacts = load_secure_model_artifacts(
+                    manifest_cid=mtx_data['ipfsCID'],
+                    expected_submitter=mtx_data['submitter'],
+                    load_weights=False  # Only need checkpoint metadata for evaluation
+                )
+                
+                if mtx_artifacts and mtx_artifacts['is_valid']:
+                    dpodl_state_checkpoint = mtx_artifacts['checkpoint_metadata']
+                    # Convert accuracy_bps to accuracy (0.0 to 1.0)
+                    accuracy_bps = dpodl_state_checkpoint.get("accuracy_bps")
+                    if isinstance(accuracy_bps, int) and 0 <= accuracy_bps <= 10000:
+                        accuracy = accuracy_bps / 10000.0
                     else:
-                        logger.warning(f"  Could not find 'accuracy' in DPoDL state for MTX ID {mtx_data['mtxId']}. Skipping.")
+                        accuracy = None
+                    logger.info(f"✓ MTX {mtx_data['mtxId']} loaded securely: accuracy_bps={accuracy_bps}, accuracy={accuracy}")
                 else:
-                    logger.warning(f"  Failed to load DPoDL state from IPFS for MTX ID {mtx_data['mtxId']} (CID: {mtx_data['ipfsCID']}). Skipping.")
+                    validation_errors = mtx_artifacts['validation_errors'] if mtx_artifacts else ['Failed to load artifacts']
+                    logger.warning(f"✗ Failed to load MTX {mtx_data['mtxId']} securely: {validation_errors}")
+                    continue
+                
+                if accuracy is not None:
+                    # Extract steps from checkpoint metadata
+                    steps = dpodl_state_checkpoint.get("steps", mtx_data['steps'])
+                    evaluated_mtxs.append({
+                        "mtxId": mtx_data['mtxId'],
+                        "ipfsCID": mtx_data['ipfsCID'],
+                        "submitter": mtx_data['submitter'],
+                        "accuracy": accuracy, # Storing the float accuracy
+                        "accuracyBPS_reported": mtx_data['accuracyBPS'], # Keep the originally reported one for comparison if needed
+                        "steps": steps,
+                        "referenceModelCID": mtx_data['referenceModelCID']
+                    })
+                    logger.info(f"  Successfully evaluated MTX ID {mtx_data['mtxId']}. Fetched Accuracy: {accuracy:.4f}, Steps: {steps}")
+                else:
+                    logger.warning(f"  Could not find valid 'accuracy_bps' in DPoDL state for MTX ID {mtx_data['mtxId']}. Skipping.")
 
         if evaluated_mtxs:
             # Select best MTX (highest accuracy, then lowest mtxId for tie-breaking)
@@ -311,13 +333,29 @@ def run_training(
             mtx_id_to_submit = best_mtx_candidate['mtxId']
 
             # Load the DPoDL state to get the actual model_state_cid submitted by the worker
-            dpodl_state_data = load_pickled_dict_from_ipfs(dpodl_checkpoint_cid_to_submit, name=f"MTX_{mtx_id_to_submit}_DPoDL_State_for_submission")
+            submission_artifacts = load_secure_model_artifacts(
+                manifest_cid=dpodl_checkpoint_cid_to_submit,
+                load_weights=False  # Only need checkpoint metadata for submission
+            )
             
             model_state_cid_to_submit = None
-            if dpodl_state_data:
+            if submission_artifacts and submission_artifacts['is_valid']:
+                dpodl_state_data = submission_artifacts['checkpoint_metadata']
+                # Extract model CID from manifest
+                if 'manifest' in submission_artifacts and submission_artifacts['manifest']:
+                    manifest = submission_artifacts['manifest']
+                    if 'files' in manifest and 'model.safetensors' in manifest['files']:
+                        model_state_cid_to_submit = manifest['files']['model.safetensors']['cid']
+                        logger.info(f"✓ Using model CID from secure manifest: {model_state_cid_to_submit}")
+            else:
+                validation_errors = submission_artifacts['validation_errors'] if submission_artifacts else ['Failed to load artifacts']
+                logger.warning(f"✗ Failed to load submission MTX {mtx_id_to_submit} securely: {validation_errors}")
+                dpodl_state_data = None
+            
+            if dpodl_state_data and not model_state_cid_to_submit:
+                # Fallback: try to get model CID from checkpoint metadata
                 # The key for model_state_cid depends on what worker.py saves it as.
                 # Common keys might be: 'final_model_state_cid', 'model_state_cid', 'model_weights_cid'.
-                # Let's assume 'final_model_state_cid' based on prior discussions on worker outputs.
                 model_state_cid_to_submit = dpodl_state_data.get("final_model_state_cid") 
                 if not model_state_cid_to_submit:
                     # Fallback to other potential keys if the primary one is not found
@@ -327,10 +365,16 @@ def run_training(
                 if not model_state_cid_to_submit:
                     # Additional fallback for old MTXs that might have model_weights_ipfs_cid
                     model_state_cid_to_submit = dpodl_state_data.get("model_weights_ipfs_cid")
-                
+                    
                 if model_state_cid_to_submit:
                     logger.info(f"Extracted Model State CID for submission: {model_state_cid_to_submit} from DPoDL Checkpoint {dpodl_checkpoint_cid_to_submit}")
-                    
+                else:
+                    # Log available keys for debugging
+                    available_keys = list(dpodl_state_data.keys()) if dpodl_state_data else []
+                    logger.warning(f"Could not find model state CID in DPoDL state for MTX ID {mtx_id_to_submit}. Available keys: {available_keys}. This MTX may be from an older version. Skipping ModelRegistry update.")
+
+            # Proceed with blockchain submission if we have model_state_cid_to_submit
+            if model_state_cid_to_submit:
                     # --- DEBUGGING: Check mtxMempoolContract address in ModelRegistry ---
                     # from . import blockchain_interface # Ensure module is loaded for direct call
                     # try:
@@ -378,10 +422,6 @@ def run_training(
                                 # For now, it will remain SelectedForProcessing but not processed by ModelRegistry.
                         else:
                             logger.error(f"FAILED to update status for MTX ID {mtx_id_to_submit} to SelectedForProcessing. Receipt: {status_update_receipt}. ModelRegistry update will not be attempted.")
-                else:
-                    # Log available keys for debugging
-                    available_keys = list(dpodl_state_data.keys()) if dpodl_state_data else []
-                    logger.warning(f"Could not find model state CID in DPoDL state for MTX ID {mtx_id_to_submit}. Available keys: {available_keys}. This MTX may be from an older version. Skipping ModelRegistry update.")
             else:
                 logger.error(f"Failed to load DPoDL state from IPFS for MTX ID {mtx_id_to_submit} (DPoDL CID: {dpodl_checkpoint_cid_to_submit}). Cannot determine model_state_cid for submission.")
 

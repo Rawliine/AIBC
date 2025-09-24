@@ -267,7 +267,7 @@ def worker_train_loop(config):
         worker_logger.info(f"Using Model Override Params: {model_override_params}")
 
     # ===>>> Pre-Hash Stage (Finding Nonce) <<<===
-    worker_logger.info(f"Starting Pre-Hash stage... Target T1: {t1_threshold}")
+    worker_logger.debug(f"Starting Pre-Hash stage... Target T1: {t1_threshold}")
     start_nonce_time = time.time()
     nonce = 0
     pre_hash_value = None
@@ -281,7 +281,7 @@ def worker_train_loop(config):
         if verify_pre_hash_threshold(calculated_hash, t1_threshold):
             pre_hash_value = calculated_hash
             found_nonce = True
-            worker_logger.info(f"Found valid nonce {nonce} after {attempt+1} attempts. Pre-Hash: {pre_hash_value}")
+            worker_logger.debug(f"Found valid nonce {nonce} after {attempt+1} attempts. Pre-Hash: {pre_hash_value}")
             break # Exit loop once valid nonce is found
         
         # Optional: Log progress periodically
@@ -550,11 +550,11 @@ def worker_train_loop(config):
             final_model_state_hash_hex = bytes_to_hex(final_model_state_hash_bytes)
             worker_logger.info(f"Final model state hash: {final_model_state_hash_hex[:10]}...")
 
-            worker_logger.info("Calculating Post-Hash...")
+            worker_logger.debug("Calculating Post-Hash...")
             post_hash_value = calculate_post_hash(final_model_state_hash_hex, accuracy, current_total_steps)
-            worker_logger.info(f"Calculated Post-Hash: {post_hash_value}")
+            worker_logger.debug(f"Calculated Post-Hash: {post_hash_value}")
 
-            worker_logger.info(f"Verifying Post-Hash against T2 threshold: {t2_threshold}")
+            worker_logger.debug(f"Verifying Post-Hash against T2 threshold: {t2_threshold}")
             is_post_hash_valid = verify_post_hash_threshold(post_hash_value, t2_threshold)
 
             # Build Merkle Tree for state verification
@@ -690,9 +690,10 @@ def worker_train_loop(config):
                             checkpoint_data_cid_for_tx = f"DUMMY_DATA_CID_BLOCK_{current_dpodl_state['steps_at_checkpoint']}"
                         else:
                             try:
-                                # Use secure save for block submissions
-                                private_key = config.get("worker_private_key")
-                                submitter_address = config.get("worker_address")
+                                # Use secure save for block submissions  
+                                # Use worker's own private key (loaded earlier based on rank)
+                                private_key = worker_private_key
+                                submitter_address = signer_address
                                 dataset_hash = config.get("dataset_hash", "default_dataset_hash")
                                 reference_dpodl_cid = current_dpodl_state.get('reference_model_id', "")
                                 
@@ -767,8 +768,9 @@ def worker_train_loop(config):
                         else:
                             try:
                                 # Use secure save for MTX submissions
-                                private_key = config.get("worker_private_key")
-                                submitter_address = config.get("worker_address")
+                                # Use worker's own private key (loaded earlier based on rank)
+                                private_key = worker_private_key
+                                submitter_address = signer_address
                                 dataset_hash = config.get("dataset_hash", "default_dataset_hash")
                                 reference_dpodl_cid = current_dpodl_state.get('reference_model_id', "")
                                 
