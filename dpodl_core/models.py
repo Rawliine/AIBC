@@ -6,19 +6,25 @@ class TransformerBlock(nn.Module):
     """
     Un bloc Transformer simplifié :
       - MultiheadAttention
-      - skip connection
-      - feed-forward (linear) + skip
+      - skip connection with LayerNorm
+      - feed-forward (linear) + skip with LayerNorm
     """
     def __init__(self, embed_dim, num_heads):
         super().__init__()
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         self.linear_ff = nn.Linear(embed_dim, embed_dim)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
         # x: [batch_size, seq_len, embed_dim]
-        attn_out, _ = self.attn(x, x, x)
+        # Pre-norm pattern for better training stability
+        normed_x = self.norm1(x)
+        attn_out, _ = self.attn(normed_x, normed_x, normed_x)
         x = x + attn_out  # skip connection
-        ff_out = F.relu(self.linear_ff(x))
+        
+        normed_x = self.norm2(x)
+        ff_out = F.relu(self.linear_ff(normed_x))
         x = x + ff_out
         return x
 
