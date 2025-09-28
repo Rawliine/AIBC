@@ -87,10 +87,18 @@ def load_dataset_and_partition(
             logger.warning(f"Local dataset path {dataset_path_override} not found. Loading {dataset_name} from Hugging Face hub.")
         else:
             logger.info(f"Loading {dataset_name} from Hugging Face hub.")
-        dataset_hf = load_dataset(dataset_name, split="train")
-        dataset_dict_hf = dataset_hf.train_test_split(test_size=1-split_ratio)
-        full_train_dataset = dataset_dict_hf["train"]
-        full_val_dataset = dataset_dict_hf["test"]
+        
+        # Fix: Load proper train/test splits instead of artificially splitting train data
+        if dataset_name == "ag_news":
+            logger.info("Using official AG News train/test splits to prevent data leakage.")
+            full_train_dataset = load_dataset(dataset_name, split="train")  # 120k samples
+            full_val_dataset = load_dataset(dataset_name, split="test")     # 7.6k samples
+        else:
+            # For other datasets, fall back to artificial split if no test split exists
+            dataset_hf = load_dataset(dataset_name, split="train")
+            dataset_dict_hf = dataset_hf.train_test_split(test_size=1-split_ratio)
+            full_train_dataset = dataset_dict_hf["train"]
+            full_val_dataset = dataset_dict_hf["test"]
 
     # Sub-sample if requested
     if num_train_samples is not None and num_train_samples < len(full_train_dataset):
