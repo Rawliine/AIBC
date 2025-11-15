@@ -200,9 +200,8 @@ describe("TaskRegistry", function () {
          });
     });
 
-    // TODO: Add tests for associateModelToTask (might require mocking or another contract)
-     describe("Model Association", function () {
-         it("Should allow associating a model CID with a task", async function(){
+    describe("Model Association", function () {
+         it("Should allow owner to associate a model CID with a task", async function(){
              const { registry, owner, publisher1 } = await loadFixture(deployTaskRegistryFixture);
              const tx = await registry.connect(publisher1).submitTask("ds_assoc", "c_assoc", 9000n, 10n, 86400n); // 9k -> 9000n, 10 -> 10n, 1d -> 86400n
              const receipt = await tx.wait();
@@ -211,9 +210,8 @@ describe("TaskRegistry", function () {
              const taskId = events[0].args.taskId;
              const modelCID = "QmModelAssociatedCID";
 
-             // NOTE: associateModelToTask is external, needs access control in real scenario
-             // For now, assume anyone can call it for testing structure
-             await expect(registry.associateModelToTask(taskId, modelCID))
+             // Owner should be able to associate model to task
+             await expect(registry.connect(owner).associateModelToTask(taskId, modelCID))
                  .to.emit(registry, "ModelAssociatedToTask")
                  .withArgs(taskId, modelCID);
 
@@ -222,9 +220,23 @@ describe("TaskRegistry", function () {
              expect(taskDetails.associatedModelCIDs[0]).to.equal(modelCID);
          });
 
+         it("Should revert when non-owner tries to associate model to task", async function(){
+             const { registry, publisher1, user1 } = await loadFixture(deployTaskRegistryFixture);
+             const tx = await registry.connect(publisher1).submitTask("ds_assoc", "c_assoc", 9000n, 10n, 86400n);
+             const receipt = await tx.wait();
+             const filter = registry.filters.TaskSubmitted();
+             const events = await registry.queryFilter(filter, receipt.blockNumber);
+             const taskId = events[0].args.taskId;
+             const modelCID = "QmModelAssociatedCID";
+
+             // Non-owner should not be able to associate model to task
+             await expect(registry.connect(user1).associateModelToTask(taskId, modelCID))
+                 .to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount");
+         });
+
           it("Should revert associating model if taskId is invalid", async function(){
-             const { registry } = await loadFixture(deployTaskRegistryFixture);
-             await expect(registry.associateModelToTask(999, "badCID"))
+             const { registry, owner } = await loadFixture(deployTaskRegistryFixture);
+             await expect(registry.connect(owner).associateModelToTask(999, "badCID"))
                  .to.be.revertedWithCustomError(registry, "InvalidTaskId");
          });
      });

@@ -188,9 +188,9 @@ contract TaskRegistry is Ownable {
     /**
      * @dev Associates a model CID with a specific task. Can be called internally or by other contracts.
      * Typically called when a model is submitted to ModelRegistry referencing this task.
-     * Requires access control if called externally.
+     * Restricted to owner to prevent unauthorized model associations.
      */
-    function associateModelToTask(uint256 _taskId, string memory _modelCID) external { // TODO: Add access control
+    function associateModelToTask(uint256 _taskId, string memory _modelCID) external onlyOwner {
         Task storage task = tasks[_taskId];
         if (task.taskId == 0) revert InvalidTaskId(_taskId);
         // Potentially check if task is Active?

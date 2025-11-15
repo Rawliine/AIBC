@@ -487,7 +487,7 @@
 *   **Enums:** `TaskStatus`.
 *   **Structs:** `Task` (details of a task).
 *   **State Variables:** `_taskIds` counter, `tasks` mapping, `tasksByPublisher` mapping.
-*   **Functions:** `submitTask`, `startTask` (owner), `completeTask` (owner/publisher), `cancelTask` (owner/publisher), `associateModelToTask` (external, TODO access control), `getTaskDetails`, `getPublisherTasks`, `getTaskCount`.
+*   **Functions:** `submitTask`, `startTask` (owner), `completeTask` (owner/publisher), `cancelTask` (owner/publisher), `associateModelToTask` (owner), `getTaskDetails`, `getPublisherTasks`, `getTaskCount`.
 *   **Interactions:** `@openzeppelin/contracts/access/Ownable.sol`.
 
 ## `blockchain/contracts/DPoDLToken.sol`
